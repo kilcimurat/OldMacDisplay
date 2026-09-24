@@ -44,6 +44,14 @@ final class CGVirtualDisplayProvider: VirtualDisplayProvider {
         }
     }
 
+    /// Creating and releasing the display each trigger a display
+    /// reconfiguration inside WindowServer, and the calls themselves block for
+    /// a noticeable fraction of a second. They run here so the UI never
+    /// freezes at connect or disconnect. Serial, so a destroy always lands
+    /// before the create that follows it.
+    private let workQueue = DispatchQueue(label: "com.oldmacdisplay.host.virtual-display",
+                                          qos: .userInitiated)
+
     deinit { destroyDisplay() }
 
     func createDisplay(configuration: VirtualDisplayConfiguration,
@@ -62,31 +70,31 @@ final class CGVirtualDisplayProvider: VirtualDisplayProvider {
         // in sync with the single Receiver.
         destroyDisplay()
 
-        log.info("Creating virtual display \(configuration.width)x\(configuration.height) @\(configuration.refreshRate)Hz (hiDPI \(configuration.hiDPI))")
-
-        // The bridge's NSError** surfaces in Swift as `throws`.
-        let handle: OMDVirtualDisplayHandle
-        do {
-            handle = try OMDVirtualDisplayBridge.createDisplay(
-                withName: configuration.name,
-                width: UInt32(configuration.width),
-                height: UInt32(configuration.height),
-                refreshRate: Double(configuration.refreshRate),
-                hiDPI: configuration.hiDPI,
-                vendorID: Identity.vendorID,
-                productID: Identity.productID,
-                serialNumber: Identity.serialNumber(for: configuration))
-        } catch {
-            log.failure("Virtual display creation", error)
-            finish(.failure(VirtualDisplayError.creationFailed(error.localizedDescription)))
-            return
-        }
-
-        // Creation is asynchronous inside macOS: the object exists before the
-        // display is listed, and registration runs on the main run loop. Poll
-        // from a background queue so the main thread stays free to deliver it.
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        workQueue.async { [weak self] in
             guard let self = self else { return }
+            self.log.info("Creating virtual display \(configuration.width)x\(configuration.height) @\(configuration.refreshRate)Hz (hiDPI \(configuration.hiDPI))")
+
+            // The bridge's NSError** surfaces in Swift as `throws`.
+            let handle: OMDVirtualDisplayHandle
+            do {
+                handle = try OMDVirtualDisplayBridge.createDisplay(
+                    withName: configuration.name,
+                    width: UInt32(configuration.width),
+                    height: UInt32(configuration.height),
+                    refreshRate: Double(configuration.refreshRate),
+                    hiDPI: configuration.hiDPI,
+                    vendorID: Identity.vendorID,
+                    productID: Identity.productID,
+                    serialNumber: Identity.serialNumber(for: configuration))
+            } catch {
+                self.log.failure("Virtual display creation", error)
+                finish(.failure(VirtualDisplayError.creationFailed(error.localizedDescription)))
+                return
+            }
+
+            // Creation is asynchronous inside macOS: the object exists before
+            // the display is listed, and registration runs on the main run
+            // loop, so this poll must never happen on the main thread.
             guard Self.waitForDisplay(handle.displayID, timeout: 3.0) else {
                 self.log.error("Display \(handle.displayID) never appeared in the active list")
                 handle.invalidate()
@@ -126,12 +134,16 @@ final class CGVirtualDisplayProvider: VirtualDisplayProvider {
     func destroyDisplay() {
         guard let handle = handle else { return }
         let id = handle.displayID
-        log.info("Destroying virtual display \(id)")
-        handle.invalidate()
         self.handle = nil
         self.currentDisplay = nil
-        // Removal is asynchronous too; macOS can keep listing it briefly. We do
-        // not block on it, because nothing downstream depends on it being gone.
+        // Releasing the object is what removes the display, and that call
+        // blocks while WindowServer reconfigures. Off the main thread.
+        // Removal is asynchronous beyond that too; macOS can keep listing it
+        // briefly. Nothing downstream depends on it being gone.
+        workQueue.async { [log] in
+            log.info("Destroying virtual display \(id)")
+            handle.invalidate()
+        }
     }
 
     /// Polls `CGGetActiveDisplayList` until the new display shows up.

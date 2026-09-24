@@ -46,6 +46,13 @@ final class StreamController {
     /// capture queue, and protects the counters below.
     private let lock = NSLock()
 
+    /// Setup and teardown run here, never on the main thread. Creating a
+    /// VTCompressionSession and an SCStream takes ~0.5 s and invalidating the
+    /// encoder waits for in-flight frames; on the main thread both showed as
+    /// the whole app freezing at connect and disconnect.
+    private let pipelineQueue = DispatchQueue(label: "com.oldmacdisplay.host.pipeline",
+                                              qos: .userInitiated)
+
     /// Last captured frame, kept so a still screen can be re-encoded.
     ///
     /// ScreenCaptureKit emits nothing while the screen is unchanged, so when
@@ -88,7 +95,7 @@ final class StreamController {
 
         DisplayCapturer.resolveDisplay(id: displayID) { [weak self] result in
             guard let self = self else { return }
-            DispatchQueue.main.async {
+            self.pipelineQueue.async {
                 switch result {
                 case .success(let display):
                     do {
@@ -155,9 +162,12 @@ final class StreamController {
         log.info("Streaming \(configuration.mode) \(configuration.codec.rawValue)")
     }
 
+    /// Returns at once; teardown completes on the pipeline queue.
     func stop() {
-        stopPipeline()
-        log.info("Stream stopped")
+        pipelineQueue.async {
+            self.stopPipeline()
+            self.log.info("Stream stopped")
+        }
     }
 
     private func stopPipeline() {

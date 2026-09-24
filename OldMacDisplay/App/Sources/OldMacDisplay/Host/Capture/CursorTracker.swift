@@ -91,17 +91,29 @@ final class CursorTracker {
             imageHeight: image.map { Double($0.size.height) }))
     }
 
-    /// Main thread: `NSCursor.currentSystem` is AppKit.
+    /// Main thread only for the AppKit read; the encoding happens on `queue`.
+    ///
+    /// AppKit hands back the same `NSImage` object while the cursor shape is
+    /// unchanged, so identity is checked first and the PNG is only produced
+    /// when the object differs. Encoding every 100 ms unconditionally on the
+    /// main thread was a measurable, permanent hitch.
+    /// Kept alive so its address cannot be reused by a different image.
+    private var lastImage: NSImage?
+
     private func sampleImage() {
         guard let cursor = NSCursor.currentSystem else { return }
         let image = cursor.image
-        guard let tiff = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff),
-              let png = bitmap.representation(using: .png, properties: [:]) else { return }
+        guard image !== lastImage else { return }
+        lastImage = image
         let hotspot = cursor.hotSpot
         let size = image.size
+
         queue.async { [weak self] in
-            guard let self = self, png != self.lastImagePNG else { return }
+            guard let self = self else { return }
+            guard let tiff = image.tiffRepresentation,
+                  let bitmap = NSBitmapImageRep(data: tiff),
+                  let png = bitmap.representation(using: .png, properties: [:]),
+                  png != self.lastImagePNG else { return }
             self.lastImagePNG = png
             self.pendingImage = (png, hotspot, size)
             self.log.debug("Cursor image changed (\(png.count) bytes, \(Int(size.width))x\(Int(size.height)))")
