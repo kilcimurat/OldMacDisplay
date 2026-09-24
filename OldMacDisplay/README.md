@@ -82,8 +82,14 @@ machines; each one enables the half it can run.
 ## Install
 
 There is no App Store build (the virtual display needs private API, see
-[docs/VIRTUAL_DISPLAY.md](docs/VIRTUAL_DISPLAY.md)). Build it once on the
-modern Mac, then copy it to the old one:
+[docs/VIRTUAL_DISPLAY.md](docs/VIRTUAL_DISPLAY.md)).
+
+**Download:** grab `OldMacDisplay.zip` from the
+[latest release](https://github.com/kilcimurat/OldMacDisplay/releases/latest).
+It is one universal app for both Macs. Unzip it, drag the app anywhere, and
+skip to [First run: permissions](#first-run-permissions).
+
+**Or build it yourself** once on the modern Mac, then copy it to the old one:
 
 ```sh
 git clone https://github.com/kilcimurat/OldMacDisplay.git
