@@ -112,20 +112,41 @@ On the old Mac, double-click the zip and drag the app anywhere.
 
 ### "Apple could not verify OldMacDisplay is free of malware"
 
-The app is signed but not notarised, so anything downloaded from the internet
-carries a quarantine flag and Gatekeeper refuses it on first launch. Either:
+<img src="docs/images/gatekeeper-warning.png" width="320" alt="Gatekeeper dialog: OldMacDisplay Not Opened">
 
-- **System Settings › Privacy & Security**, scroll to the bottom, click
-  **Open Anyway** next to the OldMacDisplay message, and confirm. Needed once.
-  (On macOS 15 and later this is the only way through the UI; right-click ›
-  Open no longer bypasses it.)
-- Or clear the flag in Terminal, adjusting the path to where you put the app:
+You will see this on the first launch of the downloaded build. The app is
+signed but not notarised, so anything downloaded from the internet carries a
+quarantine flag and Gatekeeper refuses it. It is not an error in the app;
+let it through once and it never asks again.
 
-  ```sh
-  xattr -dr com.apple.quarantine /Applications/OldMacDisplay.app
-  ```
+**Through System Settings (macOS 13 and later):**
 
-On Catalina, right-click the app › **Open** › **Open** also works.
+1. Click **Done** in the dialog. Do **not** click Move to Trash.
+2. Open **System Settings › Privacy & Security** and scroll to the
+   **Security** section at the bottom.
+3. Next to *"OldMacDisplay" was blocked to protect your Mac*, click
+   **Open Anyway**.
+
+   ![Privacy & Security, Security section, with the Open Anyway button](docs/images/open-anyway.png)
+
+4. Confirm with Touch ID or your password. The app opens; from now on it
+   launches normally.
+
+The **Open Anyway** row only appears for about an hour after a blocked
+launch attempt. If it is missing, double-click the app once more, click
+Done, and return to the settings pane.
+
+On macOS 15 and later this is the only way through the UI: right-click ›
+Open no longer bypasses the check.
+
+**Through Terminal** (alternative, adjust the path to where you put the app):
+
+```sh
+xattr -dr com.apple.quarantine /Applications/OldMacDisplay.app
+```
+
+**On Catalina** (the old iMac), right-click the app › **Open**, then **Open**
+again in the dialog.
 
 A build you make yourself with `./Scripts/build.sh` has no quarantine flag
 and opens directly.
