@@ -55,9 +55,12 @@ final class MainWindowController: NSWindowController {
 
         // Open on the tab this machine can actually use. An old Mac cannot
         // host, so showing it a disabled Host tab first would be a poor
-        // first impression.
-        tabView.selectTabViewItem(
-            HostPaneController.isSupportedOnThisMac ? hostItem : receiverItem)
+        // first impression. `--tab host|receiver` overrides the choice, for
+        // a modern Mac that is only ever used as the display.
+        let requested = MainWindowController.requestedTab()
+        let openReceiver = requested.map { $0 == "receiver" }
+            ?? !HostPaneController.isSupportedOnThisMac
+        tabView.selectTabViewItem(openReceiver ? receiverItem : hostItem)
 
         tabView.translatesAutoresizingMaskIntoConstraints = false
         guard let contentView = window?.contentView else { return }
@@ -68,6 +71,15 @@ final class MainWindowController: NSWindowController {
             tabView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 14),
             tabView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -14)
         ])
+    }
+
+    private static func requestedTab() -> String? {
+        let arguments = CommandLine.arguments
+        guard let index = arguments.firstIndex(of: "--tab"), index + 1 < arguments.count else {
+            return nil
+        }
+        let value = arguments[index + 1].lowercased()
+        return ["host", "receiver"].contains(value) ? value : nil
     }
 
     func start() {
