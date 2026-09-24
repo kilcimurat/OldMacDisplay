@@ -110,8 +110,25 @@ network share can lose the executable bit, after which macOS refuses to treat
 the bundle as an application. The zip is made with `ditto` and preserves it.
 On the old Mac, double-click the zip and drag the app anywhere.
 
-On Catalina, the first launch may be blocked by Gatekeeper because the app is
-not notarised. Right-click the app, choose **Open**, then confirm.
+### "Apple could not verify OldMacDisplay is free of malware"
+
+The app is signed but not notarised, so anything downloaded from the internet
+carries a quarantine flag and Gatekeeper refuses it on first launch. Either:
+
+- **System Settings › Privacy & Security**, scroll to the bottom, click
+  **Open Anyway** next to the OldMacDisplay message, and confirm. Needed once.
+  (On macOS 15 and later this is the only way through the UI; right-click ›
+  Open no longer bypasses it.)
+- Or clear the flag in Terminal, adjusting the path to where you put the app:
+
+  ```sh
+  xattr -dr com.apple.quarantine /Applications/OldMacDisplay.app
+  ```
+
+On Catalina, right-click the app › **Open** › **Open** also works.
+
+A build you make yourself with `./Scripts/build.sh` has no quarantine flag
+and opens directly.
 
 ## First run: permissions
 
