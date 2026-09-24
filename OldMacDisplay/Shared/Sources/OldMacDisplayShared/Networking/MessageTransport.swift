@@ -39,12 +39,23 @@ public protocol MessageTransport: AnyObject {
     /// `completion` fires once the bytes have been handed to the transport,
     /// which is what lets a caller flush a final message before terminating.
     func send(_ frame: OMDFrame, completion: ((Error?) -> Void)?)
+    /// Sends one frame whose payload is given in pieces, so a transport that
+    /// can scatter-gather (Network.framework) never has to concatenate them.
+    /// The pieces are contiguous on the wire; the peer sees one payload.
+    func send(channel: OMDChannel, flags: UInt8, parts: [Data], completion: ((Error?) -> Void)?)
     func stop()
 }
 
 public extension MessageTransport {
     func send(_ frame: OMDFrame) {
         send(frame, completion: nil)
+    }
+
+    /// Default for transports without scatter-gather: build one payload.
+    func send(channel: OMDChannel, flags: UInt8, parts: [Data], completion: ((Error?) -> Void)?) {
+        var payload = Data(capacity: parts.reduce(0) { $0 + $1.count })
+        for part in parts { payload.append(part) }
+        send(OMDFrame(channel: channel, flags: flags, payload: payload), completion: completion)
     }
 
     /// Convenience for the control channel.

@@ -18,23 +18,23 @@ unverified.
 
 ### 1. Deployment target 10.15, enforced by the package manifest
 
-`Receiver/Package.swift` declares `platforms: [.macOS(.v10_15)]`. The compiler
-then rejects any API newer than Catalina unless it is guarded with
-`@available`. This is the primary defence against accidentally using a modern
-API, and it also applies to `Shared`, which is linked into the Receiver.
+Both packages, `App/Package.swift` and `Shared/Package.swift`, declare
+`platforms: [.macOS(.v10_15)]`. The compiler then rejects any API newer than
+Catalina unless it is guarded with `@available`. This is the primary defence
+against accidentally using a modern API.
 
-The Host has its own package pinned to `.macOS(.v14)`, so Host-only code can use
-ScreenCaptureKit, modern SwiftUI and Swift Concurrency freely. This is the main
-reason the project is three packages rather than one: a single package cannot
-carry two different deployment targets.
+The app is a single universal binary that hosts on the Apple Silicon Mac and
+receives on the iMac, so the Host half cannot have its own newer deployment
+target. Every Host-only type is marked `@available(macOS 13.0, *)` and
+ScreenCaptureKit is weak-linked (see `App/Package.swift`).
 
 ### 2. x86_64
 
-The 2013 iMac is Intel. The build script always passes `--arch x86_64` for the
-Receiver. A build that defaulted to the host architecture would produce an
-arm64 binary that simply will not launch there.
+The 2013 iMac is Intel. The build script always builds
+`--arch arm64 --arch x86_64`. A build that defaulted to the host architecture
+would produce an arm64 binary that simply will not launch there.
 
-### 3. No Swift Concurrency in Shared or Receiver
+### 3. No Swift Concurrency anywhere
 
 `async`/`await` *compiles* for a 10.15 deployment target, but the resulting
 binary weakly links `@rpath/libswift_Concurrency.dylib`, which does not exist in
@@ -42,13 +42,12 @@ Catalina's `/usr/lib/swift`. Running it requires embedding the back-deployment
 copy from the toolchain into the app bundle and adding an `@loader_path` rpath.
 
 That mechanism works, but it is one more thing that can silently break on a
-machine that is slow to iterate on. Shared and the Receiver therefore use
-callbacks and `DispatchQueue` throughout, and the binary links no concurrency
-runtime at all. `Scripts/verify-catalina.sh` fails the build if this ever
-regresses.
+machine that is slow to iterate on. The whole app therefore uses callbacks and
+`DispatchQueue` throughout, and the binary links no concurrency runtime at all.
+`Scripts/verify-catalina.sh` fails the build if this ever regresses.
 
-Practical consequence: `MessageTransport`, `Heartbeat`, `NWMessageChannel` and
-`ReceiverClient` are all callback-based. Host-only code is free to use `async`.
+Practical consequence: `MessageTransport`, `Heartbeat`, `NWMessageChannel`,
+`ReceiverClient` and the Host's capture/encode pipeline are all callback-based.
 
 ## Why AppKit and not SwiftUI
 
@@ -71,7 +70,7 @@ is more direct in AppKit than through SwiftUI representables.
 4. every **strongly**-linked dylib exists in macOS 10.15
 5. reports post-Catalina overlays that are **weakly** linked (informational)
 
-It runs automatically as part of `./Scripts/build.sh receiver`.
+It runs automatically as part of `./Scripts/build.sh`.
 
 ### Why the weak/strong distinction matters
 
@@ -163,7 +162,10 @@ So the connection is unconstrained, and `ReceiverClient` carries a connect
 watchdog that fails a connection which has not become ready in 6 seconds — the
 stall is at least visible now rather than an indefinite "Connecting".
 
-**VPN avoidance remains unsolved.** Disconnect the VPN before starting a
-session. A real fix likely means resolving the Host to a concrete address on the
-desired subnet and connecting to that address rather than to the service
-endpoint, so no interface constraint is needed at all.
+**VPN avoidance remains unsolved for the first connection.** Disconnect the
+VPN before starting a session. The second (video) connection already does the
+right thing: it is opened to the concrete address the control connection
+resolved to (`NWMessageChannel.remoteEndpoint`), not to the service endpoint,
+so it lands on the same interface without any constraint. Doing the same for
+the control connection would mean resolving the Bonjour service to a concrete
+address on the chosen subnet first.

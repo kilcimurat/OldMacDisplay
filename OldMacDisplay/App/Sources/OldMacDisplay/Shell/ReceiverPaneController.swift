@@ -190,11 +190,29 @@ final class ReceiverPaneController: NSViewController {
             self?.statusLabel.stringValue = "Discovery error: \(message)"
         }
         client.onStatusChange = { [weak self] status in self?.render(status) }
-        client.onSampleBuffer = { [weak self] sampleBuffer in
-            self?.videoWindow?.enqueue(sampleBuffer)
+        client.onCursor = { [weak self] update in
+            self?.videoWindow?.updateCursor(update)
         }
-        client.displayStatsProvider = { [weak self] in
-            self?.videoWindow?.displayCounters ?? (displayed: 0, dropped: 0)
+    }
+
+    /// Points the client's frame path at a window, or at nothing.
+    ///
+    /// The sink runs on the network queue and must not touch this
+    /// controller's state, so it captures the window controller itself rather
+    /// than reaching through `self.videoWindow`, which is a main-thread
+    /// property.
+    private func routeVideo(to window: VideoWindowController?) {
+        guard let window = window else {
+            client.setVideoSink(nil)
+            client.setDisplayStatsProvider(nil)
+            return
+        }
+        window.onFrameDropped = { [weak client] in client?.requestKeyframe() }
+        client.setVideoSink { [weak window] sampleBuffer in
+            window?.enqueue(sampleBuffer)
+        }
+        client.setDisplayStatsProvider { [weak window] in
+            window?.displayCounters ?? (displayed: 0, dropped: 0)
         }
     }
 
@@ -291,6 +309,7 @@ final class ReceiverPaneController: NSViewController {
             controller.onClose = { [weak self] in
                 guard let self = self else { return }
                 self.videoWindow = nil
+                self.routeVideo(to: nil)
                 self.updateButtons()
                 // Closing the stream window is how someone sitting at the old
                 // Mac says "I'm done" — there is no other visible sign of the
@@ -300,6 +319,7 @@ final class ReceiverPaneController: NSViewController {
                 self.client.disconnect()
             }
             videoWindow = controller
+            routeVideo(to: controller)
             controller.show(enterFullScreen: false)
             log.info("Opened stream window")
         }
@@ -310,6 +330,7 @@ final class ReceiverPaneController: NSViewController {
     private func closeVideoWindow() {
         guard let window = videoWindow else { return }
         isClosingVideoWindow = true
+        routeVideo(to: nil)
         window.clear()
         window.close()
         videoWindow = nil
@@ -365,14 +386,20 @@ final class ReceiverPaneController: NSViewController {
                                   Double(status.measuredBitrateBPS) / 1_000_000))
         }
         if status.networkType != .unknown {
-            details.append(status.networkType == .ethernet
-                           ? "over Ethernet" : "over \(status.networkType.rawValue.capitalized)")
+            var link = status.networkType == .ethernet
+                ? "over Ethernet" : "over \(status.networkType.rawValue.capitalized)"
+            if status.videoOnSeparateConnection { link += " (2 connections)" }
+            details.append(link)
         }
         if let error = status.lastError { details.append(error) }
         PaneStyle.setText(detailLabel, details.joined(separator: " · "))
 
-        latencyLabel.stringValue = status.latencyMilliseconds
+        var latency = status.latencyMilliseconds
             .map { String(format: "Latency: %.1f ms round trip", $0) } ?? "Latency: —"
+        if let endToEnd = status.endToEndMilliseconds {
+            latency += String(format: " · %.0f ms capture → screen", endToEnd)
+        }
+        latencyLabel.stringValue = latency
 
         updateButtons()
     }

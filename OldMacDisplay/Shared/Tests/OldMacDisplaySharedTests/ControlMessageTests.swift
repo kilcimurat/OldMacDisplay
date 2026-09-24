@@ -27,6 +27,7 @@ final class ControlMessageTests: XCTestCase {
             codec: .h264, targetBitrateBPS: 11_000_000)
 
         try assertRoundTrip(.hello(.init(device: device)))
+        try assertRoundTrip(.hello(.init(device: device, sessionToken: "TOKEN-1")))
         try assertRoundTrip(.clientCapabilities(sampleClientCapabilities()))
         try assertRoundTrip(.serverCapabilities(.init(
             supportedCodecs: [.h264, .hevc], h264HardwareEncode: true,
@@ -40,8 +41,20 @@ final class ControlMessageTests: XCTestCase {
         try assertRoundTrip(.networkStats(.init(fps: 60, bitrateBPS: 11_500_000,
                                                 droppedFrameRatio: 0.002,
                                                 decodeMillis: 5, renderMillis: 3)))
+        try assertRoundTrip(.networkStats(.init(fps: 60, bitrateBPS: 11_500_000,
+                                                droppedFrameRatio: 0.002,
+                                                decodeMillis: 5, renderMillis: 3,
+                                                queueingDelayMillis: 42.5,
+                                                endToEndMillis: 31)))
         try assertRoundTrip(.ping(.init(sequence: 7, sentAt: 123.456)))
         try assertRoundTrip(.pong(.init(sequence: 7, sentAt: 123.456)))
+        try assertRoundTrip(.pong(.init(sequence: 7, sentAt: 123.456, receivedAt: 9876.5)))
+        try assertRoundTrip(.attachVideo(.init(sessionToken: "TOKEN-1")))
+        try assertRoundTrip(.cursor(.init(x: 0.25, y: 0.75, visible: true)))
+        try assertRoundTrip(.cursor(.init(x: 0.25, y: 0.75, visible: true,
+                                          imagePNG: Data([0x89, 0x50, 0x4E, 0x47]),
+                                          hotspotX: 4, hotspotY: 4,
+                                          imageWidth: 32, imageHeight: 32)))
         try assertRoundTrip(.disconnect(.init(reason: "User quit")))
         try assertRoundTrip(.error(.init(code: "E_VERSION", message: "bad version")))
     }
@@ -65,10 +78,22 @@ final class ControlMessageTests: XCTestCase {
 
     func testPongEchoesPingTimestampExactly() {
         let ping = ControlMessage.Ping(sequence: 42, sentAt: 987.654321)
-        let pong = ControlMessage.Pong(echoing: ping)
+        let pong = ControlMessage.Pong(echoing: ping, receivedAt: 5)
         XCTAssertEqual(pong.sequence, ping.sequence)
         // RTT correctness depends on this being bit-identical, not merely close.
         XCTAssertEqual(pong.sentAt, ping.sentAt)
+        XCTAssertEqual(pong.receivedAt, 5)
+    }
+
+    /// Optional fields added in v2 must decode when absent, so a peer that
+    /// omits them (or an older payload shape) is still understood.
+    func testOptionalV2FieldsDecodeWhenAbsent() throws {
+        let pong = Data(#"{"type":"pong","payload":{"sequence":1,"sentAt":2.5}}"#.utf8)
+        XCTAssertEqual(try ControlCodec.decode(pong), .pong(.init(sequence: 1, sentAt: 2.5)))
+        let stats = Data(#"{"type":"networkStats","payload":{"fps":60,"bitrateBPS":1,"droppedFrameRatio":0,"decodeMillis":0,"renderMillis":0}}"#.utf8)
+        XCTAssertEqual(try ControlCodec.decode(stats),
+                       .networkStats(.init(fps: 60, bitrateBPS: 1, droppedFrameRatio: 0,
+                                           decodeMillis: 0, renderMillis: 0)))
     }
 
     func testUnknownTypeFailsCleanly() {

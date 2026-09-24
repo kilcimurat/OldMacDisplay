@@ -164,7 +164,16 @@ final class CapabilityNegotiatorTests: XCTestCase {
         let wireless = CapabilityNegotiator.chooseBitrate(
             mode: mode, codec: .h264, quality: .balanced, network: .wifi)
         XCTAssertGreaterThan(wired, wireless)
-        XCTAssertLessThanOrEqual(wireless, 15_000_000)
+        XCTAssertLessThanOrEqual(wireless, 20_000_000)
+    }
+
+    /// Sharp desktop text needs a real budget: Balanced 1080p60 on a wire must
+    /// not open below what screen-sharing tools consider the floor.
+    func testBalancedFullHDOnEthernetOpensAtACrispBitrate() {
+        let mode = DisplayMode(width: 1920, height: 1080, refreshRate: 60)
+        let wired = CapabilityNegotiator.chooseBitrate(
+            mode: mode, codec: .h264, quality: .balanced, network: .ethernet)
+        XCTAssertGreaterThanOrEqual(wired, 15_000_000)
     }
 
     func testQualityPresetsAreOrdered() {

@@ -10,6 +10,12 @@ final class VideoWindowController: NSWindowController, NSWindowDelegate {
 
     /// Called when the user closes the stream window or leaves the session.
     var onClose: (() -> Void)?
+    /// The renderer discarded a frame; forwarded from the video view on the
+    /// enqueueing thread.
+    var onFrameDropped: (() -> Void)? {
+        get { videoView.onFrameDropped }
+        set { videoView.onFrameDropped = newValue }
+    }
 
     private let videoView = VideoDisplayView(frame: NSRect(x: 0, y: 0, width: 1280, height: 720))
     private let log = Log(.renderer)
@@ -50,8 +56,9 @@ final class VideoWindowController: NSWindowController, NSWindowDelegate {
 
     /// Sizes the window to the stream so the image is shown 1:1 when windowed.
     func adopt(configuration: ControlMessage.VideoConfiguration) {
-        guard let window = window, !isFullScreen else { return }
         let size = NSSize(width: configuration.encodedWidth, height: configuration.encodedHeight)
+        videoView.setVideoSize(size)
+        guard let window = window, !isFullScreen else { return }
         // Never open larger than the panel it is being shown on.
         let visible = (window.screen ?? NSScreen.main)?.visibleFrame.size
             ?? NSSize(width: 1280, height: 720)
@@ -60,8 +67,14 @@ final class VideoWindowController: NSWindowController, NSWindowDelegate {
         window.center()
     }
 
+    /// Any thread.
     func enqueue(_ sampleBuffer: CMSampleBuffer) {
         videoView.enqueue(sampleBuffer)
+    }
+
+    /// Main thread.
+    func updateCursor(_ update: ControlMessage.CursorUpdate) {
+        videoView.updateCursor(update)
     }
 
     func clear() {
@@ -77,7 +90,7 @@ final class VideoWindowController: NSWindowController, NSWindowDelegate {
     }
 
     /// Renderer counters, reported back to the Host as the real measure of how
-    /// much of the stream is reaching the screen.
+    /// much of the stream is reaching the screen. Any thread.
     var displayCounters: (displayed: Int, dropped: Int) {
         (displayed: videoView.framesDisplayed, dropped: videoView.framesDropped)
     }

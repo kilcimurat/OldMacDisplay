@@ -3,7 +3,10 @@ import Foundation
 /// Static facts about the OldMacDisplay wire protocol.
 public enum OMDProtocol {
     /// Bumped whenever the wire format or message set changes incompatibly.
-    public static let version: UInt8 = 1
+    ///
+    /// v2: separate video connection (`attachVideo`), out-of-band cursor,
+    /// clock-sync fields in `pong`, queueing/latency fields in `networkStats`.
+    public static let version: UInt8 = 2
 
     /// Bonjour service type advertised by the Host and browsed by the Receiver.
     public static let bonjourServiceType = "_oldmacdisplay._tcp"

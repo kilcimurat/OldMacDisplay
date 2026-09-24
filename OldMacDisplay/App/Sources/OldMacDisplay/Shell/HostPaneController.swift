@@ -347,6 +347,12 @@ final class HostPaneController: NSViewController {
                               status.measuredFPS,
                               Double(status.measuredBitrateBPS) / 1_000_000,
                               status.encodeMillis)
+            // Only worth a mention once the adaptive loop has moved off the
+            // negotiated target.
+            if let current = status.currentBitrateBPS,
+               let target = status.negotiated?.targetBitrateBPS, current != target {
+                text += String(format: " · adapted to %.1f Mbps", Double(current) / 1_000_000)
+            }
             // Only shown once it actually happens: a permanent "dropped: 0" is
             // noise, but a rising count is the clearest sign of a bad link.
             if status.networkDroppedFrames > 0 {
@@ -360,14 +366,21 @@ final class HostPaneController: NSViewController {
                 if let ratio = status.receiverDropRatio, ratio > 0.01 {
                     text += String(format: ", %.0f%% dropped", ratio * 100)
                 }
+                if let queueing = status.receiverQueueingMillis, queueing >= 5 {
+                    text += String(format: ", queueing %.0f ms", queueing)
+                }
             }
             PaneStyle.setText(streamLabel, text)
         } else {
             PaneStyle.setText(streamLabel, "")
         }
 
-        latencyLabel.stringValue = status.latencyMilliseconds
+        var latency = status.latencyMilliseconds
             .map { String(format: "Latency: %.1f ms round trip", $0) } ?? "Latency: —"
+        if let endToEnd = status.receiverEndToEndMillis {
+            latency += String(format: " · %.0f ms capture → screen", endToEnd)
+        }
+        latencyLabel.stringValue = latency
 
         if let error = status.lastError {
             errorLabel.stringValue = error

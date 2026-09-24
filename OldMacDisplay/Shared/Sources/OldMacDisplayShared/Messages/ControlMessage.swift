@@ -1,11 +1,10 @@
 import Foundation
 
-/// Every control-channel message in protocol version 1.
+/// Every control-channel message in protocol version 2.
 ///
 /// The full message set from the design is declared up front so the protocol is
-/// stable, but only the Phase 1 subset (`hello`, `capabilities`, `ping`/`pong`,
-/// `disconnect`, `error`) is exercised today. Unknown/unimplemented cases decode
-/// fine and are simply ignored by the current handlers.
+/// stable. Unknown/unimplemented cases decode fine and are simply ignored by
+/// the current handlers.
 ///
 /// Encoding is JSON with an explicit `type` discriminator — never Swift object
 /// serialisation (`NSKeyedArchiver`/`Codable` default enum layout), so the wire
@@ -25,15 +24,62 @@ public enum ControlMessage: Equatable {
     case pong(Pong)
     case disconnect(Disconnect)
     case error(ProtocolError)
+    /// Sent as the first frame on a second TCP connection to bind it to an
+    /// existing session as the video carrier.
+    case attachVideo(AttachVideo)
+    /// Pointer position and shape on the virtual display, sent instead of
+    /// baking the cursor into the video.
+    case cursor(CursorUpdate)
 
     // MARK: - Payloads
 
     public struct Hello: Codable, Equatable {
         public let protocolVersion: Int
         public let device: DeviceInfo
-        public init(protocolVersion: Int = Int(OMDProtocol.version), device: DeviceInfo) {
+        /// Set by the Host in its reply. The Receiver presents it on a second
+        /// connection (`attachVideo`) so the Host can pair the two.
+        public let sessionToken: String?
+        public init(protocolVersion: Int = Int(OMDProtocol.version),
+                    device: DeviceInfo,
+                    sessionToken: String? = nil) {
             self.protocolVersion = protocolVersion
             self.device = device
+            self.sessionToken = sessionToken
+        }
+    }
+
+    public struct AttachVideo: Codable, Equatable {
+        public let sessionToken: String
+        public init(sessionToken: String) { self.sessionToken = sessionToken }
+    }
+
+    /// Where the pointer is on the streamed display, normalised to 0...1 so the
+    /// Receiver can place it regardless of how the video is scaled.
+    ///
+    /// `imagePNG` is only present when the cursor shape changed; the Receiver
+    /// keeps the last image it was given. `hotspot` and `imageSize` are in
+    /// points of the encoded display.
+    public struct CursorUpdate: Codable, Equatable {
+        public let x: Double
+        public let y: Double
+        public let visible: Bool
+        public let imagePNG: Data?
+        public let hotspotX: Double?
+        public let hotspotY: Double?
+        public let imageWidth: Double?
+        public let imageHeight: Double?
+        public init(x: Double, y: Double, visible: Bool,
+                    imagePNG: Data? = nil,
+                    hotspotX: Double? = nil, hotspotY: Double? = nil,
+                    imageWidth: Double? = nil, imageHeight: Double? = nil) {
+            self.x = x
+            self.y = y
+            self.visible = visible
+            self.imagePNG = imagePNG
+            self.hotspotX = hotspotX
+            self.hotspotY = hotspotY
+            self.imageWidth = imageWidth
+            self.imageHeight = imageHeight
         }
     }
 
@@ -49,16 +95,23 @@ public enum ControlMessage: Equatable {
         }
     }
 
+    /// `receivedAt` is the responder's own monotonic clock when the ping
+    /// arrived. Together with the RTT it lets the pinger estimate the offset
+    /// between the two clocks (see `ClockOffsetEstimator`), which is what makes
+    /// one-way, capture-to-display latency measurable.
     public struct Pong: Codable, Equatable {
         public let sequence: UInt32
         public let sentAt: Double
-        public init(sequence: UInt32, sentAt: Double) {
+        public let receivedAt: Double?
+        public init(sequence: UInt32, sentAt: Double, receivedAt: Double? = nil) {
             self.sequence = sequence
             self.sentAt = sentAt
+            self.receivedAt = receivedAt
         }
-        public init(echoing ping: Ping) {
+        public init(echoing ping: Ping, receivedAt: Double? = nil) {
             self.sequence = ping.sequence
             self.sentAt = ping.sentAt
+            self.receivedAt = receivedAt
         }
     }
 
@@ -85,13 +138,22 @@ public enum ControlMessage: Equatable {
         public let droppedFrameRatio: Double
         public let decodeMillis: Double
         public let renderMillis: Double
+        /// How much later than its steady-state schedule the worst frame of the
+        /// window arrived. Clock-independent; the Host's congestion signal.
+        public let queueingDelayMillis: Double?
+        /// Capture-to-enqueue latency, when the clocks have been aligned.
+        public let endToEndMillis: Double?
         public init(fps: Double, bitrateBPS: Int, droppedFrameRatio: Double,
-                    decodeMillis: Double, renderMillis: Double) {
+                    decodeMillis: Double, renderMillis: Double,
+                    queueingDelayMillis: Double? = nil,
+                    endToEndMillis: Double? = nil) {
             self.fps = fps
             self.bitrateBPS = bitrateBPS
             self.droppedFrameRatio = droppedFrameRatio
             self.decodeMillis = decodeMillis
             self.renderMillis = renderMillis
+            self.queueingDelayMillis = queueingDelayMillis
+            self.endToEndMillis = endToEndMillis
         }
     }
 
@@ -134,6 +196,8 @@ extension ControlMessage: Codable {
         case pong
         case disconnect
         case error
+        case attachVideo
+        case cursor
     }
 
     public var kind: Kind {
@@ -152,6 +216,8 @@ extension ControlMessage: Codable {
         case .pong: return .pong
         case .disconnect: return .disconnect
         case .error: return .error
+        case .attachVideo: return .attachVideo
+        case .cursor: return .cursor
         }
     }
 
@@ -170,6 +236,8 @@ extension ControlMessage: Codable {
         case .pong(let v):                  try container.encode(v, forKey: .payload)
         case .disconnect(let v):            try container.encode(v, forKey: .payload)
         case .error(let v):                 try container.encode(v, forKey: .payload)
+        case .attachVideo(let v):           try container.encode(v, forKey: .payload)
+        case .cursor(let v):                try container.encode(v, forKey: .payload)
         case .streamStart, .streamStop, .requestKeyframe:
             break // no payload
         }
@@ -201,6 +269,10 @@ extension ControlMessage: Codable {
             self = .disconnect(try container.decode(Disconnect.self, forKey: .payload))
         case .error:
             self = .error(try container.decode(ProtocolError.self, forKey: .payload))
+        case .attachVideo:
+            self = .attachVideo(try container.decode(AttachVideo.self, forKey: .payload))
+        case .cursor:
+            self = .cursor(try container.decode(CursorUpdate.self, forKey: .payload))
         case .streamStart:     self = .streamStart
         case .streamStop:      self = .streamStop
         case .requestKeyframe: self = .requestKeyframe

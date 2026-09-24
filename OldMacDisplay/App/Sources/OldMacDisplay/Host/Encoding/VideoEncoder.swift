@@ -34,9 +34,16 @@ final class VideoEncoder {
     private var session: VTCompressionSession?
     private let log = Log(.encoder)
 
-    /// Parameter sets are resent with every keyframe, but only when they change,
-    /// to avoid a pointless few hundred bytes on every GOP.
+    /// Parameter sets are resent with every keyframe, but only when they change
+    /// or a Receiver asked for a keyframe (it may have lost them), to avoid a
+    /// pointless few hundred bytes on every GOP.
     private var lastParameterSets: [Data]?
+
+    /// Guards the two request flags, which are set from whichever thread asks
+    /// for a keyframe and read on the capture and encoder-callback threads.
+    private let flagLock = NSLock()
+    private var nextFrameForcesKeyframe = false
+    private var resendParameterSets = false
 
     init(configuration: Configuration) throws {
         self.configuration = configuration
@@ -145,12 +152,19 @@ final class VideoEncoder {
         try set(kVTCompressionPropertyKey_ExpectedFrameRate,
                 NSNumber(value: configuration.frameRate), "ExpectedFrameRate")
 
-        // Short GOP: a keyframe every 2 seconds bounds how long corruption or a
-        // late join can persist, without spending too much bitrate on IDRs.
+        // Long GOP. The transport is TCP, so nothing is lost on the wire, and
+        // every path that can desynchronise the Receiver (a dropped frame on
+        // either side, a late join, a reconnect) explicitly asks for an IDR.
+        // Periodic keyframes therefore only cost bitrate: on a mostly static
+        // desktop one every 2 s was the single largest consumer, and it showed
+        // as a visible quality pulse on small text. Kept finite as a safety
+        // net against a missed request.
         try set(kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                NSNumber(value: configuration.frameRate * 2), "MaxKeyFrameInterval")
+                NSNumber(value: configuration.frameRate * VideoEncoder.keyframeIntervalSeconds),
+                "MaxKeyFrameInterval")
         try set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
-                NSNumber(value: 2.0), "MaxKeyFrameIntervalDuration")
+                NSNumber(value: Double(VideoEncoder.keyframeIntervalSeconds)),
+                "MaxKeyFrameIntervalDuration")
 
         // Hard cap slightly above the average so a burst cannot flood the link
         // and build a multi-second queue. [bytes, seconds].
@@ -172,6 +186,8 @@ final class VideoEncoder {
                  kCFBooleanFalse, "MaximizePowerEfficiency")
         }
     }
+
+    static let keyframeIntervalSeconds = 30
 
     func invalidate() {
         guard let session = session else { return }
@@ -221,17 +237,29 @@ final class VideoEncoder {
         }
     }
 
-    /// Forces the next frame to be an IDR. Used when the Receiver reconnects or
-    /// explicitly asks for one after loss.
+    /// Forces the next frame to be an IDR, with its parameter sets. Used when
+    /// the Receiver reconnects or explicitly asks for one after loss.
     func requestKeyframe() {
+        flagLock.lock()
         nextFrameForcesKeyframe = true
+        resendParameterSets = true
+        flagLock.unlock()
     }
 
-    private(set) var nextFrameForcesKeyframe = false
-
     func consumeKeyframeRequest() -> Bool {
-        defer { nextFrameForcesKeyframe = false }
-        return nextFrameForcesKeyframe
+        flagLock.lock()
+        defer { flagLock.unlock() }
+        let requested = nextFrameForcesKeyframe
+        nextFrameForcesKeyframe = false
+        return requested
+    }
+
+    private func consumeParameterSetResend() -> Bool {
+        flagLock.lock()
+        defer { flagLock.unlock() }
+        let requested = resendParameterSets
+        resendParameterSets = false
+        return requested
     }
 
     /// Adjusts bitrate on a live session, without tearing the encoder down.
@@ -274,9 +302,32 @@ final class VideoEncoder {
             return
         }
 
-        // One copy out of the CMBlockBuffer into the packet. This is the only
-        // copy on the encode path; the bitstream is passed through untouched.
-        let payload = Data(bytes: pointer, count: totalLength)
+        // Zero-copy: the packet's Data points into the CMBlockBuffer and keeps
+        // the sample buffer alive until the transport has released the bytes.
+        // VideoToolbox's output is a single contiguous block in practice; the
+        // copying path is only for the case where it is not.
+        var contiguousLength = 0
+        CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0,
+                                    lengthAtOffsetOut: &contiguousLength,
+                                    totalLengthOut: nil, dataPointerOut: nil)
+        let payload: Data
+        if contiguousLength == totalLength {
+            let retained = sampleBuffer
+            payload = Data(bytesNoCopy: UnsafeMutableRawPointer(pointer), count: totalLength,
+                           deallocator: .custom { _, _ in _ = retained })
+        } else {
+            var copy = Data(count: totalLength)
+            let copyStatus = copy.withUnsafeMutableBytes { raw -> OSStatus in
+                guard let base = raw.baseAddress else { return kCMBlockBufferBadPointerParameterErr }
+                return CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0,
+                                                  dataLength: totalLength, destination: base)
+            }
+            guard copyStatus == kCMBlockBufferNoErr else {
+                log.error("CMBlockBufferCopyDataBytes failed: \(copyStatus)")
+                return
+            }
+            payload = copy
+        }
 
         onPacket?(VideoPacket(kind: .accessUnit,
                               isKeyframe: isKeyframe,
@@ -292,10 +343,11 @@ final class VideoEncoder {
             log.error("Could not read parameter sets from format description")
             return
         }
-        guard sets.sets != lastParameterSets else { return }
+        let forced = consumeParameterSetResend()
+        guard forced || sets.sets != lastParameterSets else { return }
         lastParameterSets = sets.sets
 
-        log.info("Parameter sets changed (\(sets.sets.count) sets, NAL length \(sets.nalUnitHeaderLength))")
+        log.info("Sending parameter sets (\(sets.sets.count) sets, NAL length \(sets.nalUnitHeaderLength), \(forced ? "requested" : "changed"))")
         onPacket?(VideoPacket(kind: .parameterSets,
                               isKeyframe: true,
                               nalUnitHeaderLength: UInt8(sets.nalUnitHeaderLength),

@@ -10,6 +10,10 @@ public final class Heartbeat {
     public var onSample: ((LatencyTracker) -> Void)?
 
     public private(set) var tracker = LatencyTracker()
+    /// Peer clock relative to ours, refined with every pong that carries a
+    /// `receivedAt`. Lets the Receiver turn Host capture timestamps into local
+    /// time for a true capture-to-display latency figure.
+    public private(set) var clockOffset = ClockOffsetEstimator()
 
     private let interval: Double
     private let queue: DispatchQueue
@@ -47,6 +51,7 @@ public final class Heartbeat {
 
     public func reset() {
         tracker.reset()
+        clockOffset.reset()
         sequence = 0
     }
 
@@ -64,16 +69,21 @@ public final class Heartbeat {
         case .ping(let ping):
             // Reply immediately and on this queue: any delay here is
             // indistinguishable from network latency to the peer.
-            send(.pong(ControlMessage.Pong(echoing: ping)))
+            send(.pong(ControlMessage.Pong(echoing: ping, receivedAt: now())))
             return true
 
         case .pong(let pong):
-            let rtt = now() - pong.sentAt
+            let returnedAt = now()
+            let rtt = returnedAt - pong.sentAt
             guard rtt >= 0 else {
                 log.error("Discarding pong \(pong.sequence) with a negative RTT")
                 return true
             }
             tracker.record(rtt: rtt)
+            if let peerReceivedAt = pong.receivedAt {
+                clockOffset.record(sentAt: pong.sentAt, peerReceivedAt: peerReceivedAt,
+                                   returnedAt: returnedAt)
+            }
             log.debug(String(format: "RTT seq %u: %.2f ms (smoothed %.2f ms)",
                              pong.sequence, rtt * 1000, tracker.smoothedMilliseconds ?? 0))
             onSample?(tracker)

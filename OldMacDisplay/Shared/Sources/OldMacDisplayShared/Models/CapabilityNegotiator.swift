@@ -134,13 +134,16 @@ public enum CapabilityNegotiator {
                               codec: VideoCodec,
                               quality: QualityPreset,
                               network: NetworkType) -> Int {
-        // Bits per pixel per frame. Desktop/IDE content is mostly static with
-        // sharp text, so these sit above what a video-playback tuning would use.
+        // Bits per pixel per frame. Desktop/IDE content is sharp text on flat
+        // colour, which H.264 handles far worse than camera video: at the
+        // 0.08 bpp first tried here, scrolling at 1080p60 (~10 Mbps) was
+        // visibly blocky. Screen-sharing tools sit at 15-30 Mbps for 1080p60;
+        // these land Balanced at ~20 Mbps on Ethernet.
         let bitsPerPixel: Double
         switch quality {
-        case .performance: bitsPerPixel = 0.05
-        case .balanced:    bitsPerPixel = 0.08
-        case .quality:     bitsPerPixel = 0.12
+        case .performance: bitsPerPixel = 0.10
+        case .balanced:    bitsPerPixel = 0.16
+        case .quality:     bitsPerPixel = 0.24
         }
 
         let pixels = Double(mode.width * mode.height)
@@ -153,8 +156,8 @@ public enum CapabilityNegotiator {
         let ceiling: Double
         switch network {
         case .ethernet:        ceiling = 40_000_000
-        case .wifi:            ceiling = 15_000_000
-        case .other, .unknown: ceiling = 12_000_000
+        case .wifi:            ceiling = 20_000_000
+        case .other, .unknown: ceiling = 15_000_000
         }
         if network != .ethernet { bitrate *= 0.7 }
 

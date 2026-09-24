@@ -49,15 +49,27 @@ public struct VideoPacket: Equatable {
     }
 
     public func encode() -> Data {
-        var out = Data(capacity: VideoPacket.headerLength + payload.count)
+        var out = encodeHeader()
+        out.append(payload)
+        return out
+    }
+
+    /// The 16-byte header alone.
+    public func encodeHeader() -> Data {
+        var out = Data(capacity: VideoPacket.headerLength)
         out.append(kind.rawValue)
         out.append(isKeyframe ? 1 : 0)
         out.append(nalUnitHeaderLength)
         out.append(0) // reserved
         out.append(contentsOf: ByteOrder.bigEndian(presentationTimeMicros))
         out.append(contentsOf: ByteOrder.bigEndian(encodeDurationMicros))
-        out.append(payload)
         return out
+    }
+
+    /// Header and payload as separate buffers for a scatter-gather send. The
+    /// payload is the encoder's bitstream and is never copied here.
+    public func encodedParts() -> [Data] {
+        [encodeHeader(), payload]
     }
 
     public static func decode(_ data: Data) throws -> VideoPacket {
@@ -72,7 +84,9 @@ public struct VideoPacket: Equatable {
             nalUnitHeaderLength: data[base + 2],
             presentationTimeMicros: ByteOrder.readUInt64(data, at: base + 4),
             encodeDurationMicros: ByteOrder.readUInt32(data, at: base + 12),
-            payload: Data(data[(base + headerLength)...]))
+            // A slice, not a copy: the bitstream is handed straight on to
+            // CoreMedia. Consumers index it via `startIndex`/`withUnsafeBytes`.
+            payload: data[(base + headerLength)...])
     }
 }
 

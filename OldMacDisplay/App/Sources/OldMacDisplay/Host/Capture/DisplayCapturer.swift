@@ -111,7 +111,11 @@ final class DisplayCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
         // Encoder-native format: no colour conversion between capture and
         // VideoToolbox, which keeps the path close to zero-copy.
         streamConfig.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        streamConfig.showsCursor = true
+        // The cursor is not baked into the video. With it in, every mouse
+        // movement over an otherwise static desktop forced a full re-encode;
+        // instead `CursorTracker` sends the pointer out of band and the
+        // Receiver draws it, so a still screen costs nothing on the wire.
+        streamConfig.showsCursor = false
         // A short queue is deliberate: if the encoder falls behind we want
         // ScreenCaptureKit to drop frames rather than build a latency backlog.
         streamConfig.queueDepth = 3

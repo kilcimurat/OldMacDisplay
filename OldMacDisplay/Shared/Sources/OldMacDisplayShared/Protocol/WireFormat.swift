@@ -40,29 +40,39 @@ public enum WireFormat {
     public static let headerLength = 12
 
     public static func encode(_ frame: OMDFrame) throws -> Data {
-        let length = UInt32(frame.payload.count)
-        guard length <= OMDProtocol.maxPayloadLength else {
-            throw WireFormatError.payloadTooLarge(length)
-        }
-        var out = Data(capacity: headerLength + frame.payload.count)
-        out.append(contentsOf: magic)
-        out.append(OMDProtocol.version)
-        out.append(frame.channel.rawValue)
-        out.append(frame.flags)
-        out.append(0) // reserved
-        out.append(contentsOf: bigEndianBytes(length))
+        var out = try encodeHeader(channel: frame.channel, flags: frame.flags,
+                                   payloadLength: frame.payload.count)
         out.append(frame.payload)
         return out
     }
 
-    /// Parsed header fields, used by the incremental parser.
-    struct Header {
-        let channel: OMDChannel
-        let flags: UInt8
-        let payloadLength: UInt32
+    /// Just the 12-byte header, so a transport can send it and the payload as
+    /// separate buffers instead of concatenating them into a fresh copy.
+    public static func encodeHeader(channel: OMDChannel, flags: UInt8 = 0,
+                                    payloadLength: Int) throws -> Data {
+        guard payloadLength >= 0, payloadLength <= Int(OMDProtocol.maxPayloadLength) else {
+            throw WireFormatError.payloadTooLarge(UInt32(clamping: payloadLength))
+        }
+        let length = UInt32(payloadLength)
+        var out = Data(capacity: headerLength + payloadLength)
+        out.append(contentsOf: magic)
+        out.append(OMDProtocol.version)
+        out.append(channel.rawValue)
+        out.append(flags)
+        out.append(0) // reserved
+        out.append(contentsOf: bigEndianBytes(length))
+        return out
     }
 
-    static func decodeHeader(_ data: Data) throws -> Header {
+    /// Parsed header fields, used by the incremental parser and by transports
+    /// that read a header and then exactly its payload.
+    public struct Header: Equatable {
+        public let channel: OMDChannel
+        public let flags: UInt8
+        public let payloadLength: UInt32
+    }
+
+    public static func decodeHeader(_ data: Data) throws -> Header {
         guard data.count >= headerLength else { throw WireFormatError.truncatedHeader }
         // `data` may be a slice with a non-zero startIndex, so index relative to it.
         let base = data.startIndex

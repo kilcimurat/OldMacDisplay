@@ -6,6 +6,7 @@ import OldMacDisplayShared
 /// The Receiver's side of a session with one Host.
 ///
 /// Owns discovery-independent connection logic: connect, handshake, heartbeat,
+/// a second connection for video once the Host has issued a session token,
 /// and automatic reconnection within a grace period so a briefly unplugged
 /// Ethernet cable does not end the session.
 final class ReceiverClient {
@@ -16,25 +17,31 @@ final class ReceiverClient {
         var serverCapabilities: ServerCapabilities?
         var negotiated: SessionConfiguration?
         var latencyMilliseconds: Double?
+        /// Capture-to-enqueue latency once the clocks have been aligned.
+        var endToEndMilliseconds: Double?
         var networkType: NetworkType = .unknown
         var lastError: String?
         var video: ControlMessage.VideoConfiguration?
         var streaming = false
         var measuredFPS: Double = 0
         var measuredBitrateBPS: Int = 0
+        /// True while video arrives on its own connection.
+        var videoOnSeparateConnection = false
     }
 
     /// How long to keep retrying before declaring the session dead.
     var reconnectGracePeriod: TimeInterval = 30
 
     var onStatusChange: ((Status) -> Void)?
-    /// Decoded-and-ready sample buffers, delivered on `callbackQueue`.
-    var onSampleBuffer: ((CMSampleBuffer) -> Void)?
+    /// Pointer updates, delivered on `callbackQueue`.
+    var onCursor: ((ControlMessage.CursorUpdate) -> Void)?
 
     /// Supplies renderer counters for the stats report sent back to the Host.
-    /// Set by the UI, which owns the display layer.
-    var displayStatsProvider: (() -> (displayed: Int, dropped: Int))?
+    /// Set through `setDisplayStatsProvider`; called on the network queue, so
+    /// the provider must be thread-safe.
+    private var displayStatsProvider: (() -> (displayed: Int, dropped: Int))?
 
+    /// Only ever read or written on `callbackQueue`.
     private(set) var status = Status() {
         didSet {
             guard status != oldValue else { return }
@@ -44,12 +51,15 @@ final class ReceiverClient {
     }
 
     private let profile: ReceiverHardwareProfile
-    private let queue = DispatchQueue(label: "com.oldmacdisplay.receiver.network")
+    private let queue = DispatchQueue(label: "com.oldmacdisplay.receiver.network",
+                                      qos: .userInteractive)
     private let callbackQueue: DispatchQueue
     private let pathObserver: PathObserver
     private let log = Log(.network)
 
+    // Everything below is touched on `queue` only.
     private var transport: NWMessageChannel?
+    private var videoTransport: NWMessageChannel?
     private var heartbeat: Heartbeat?
     private var stateMachine = ConnectionStateMachine()
     private var target: NWEndpoint?
@@ -61,10 +71,17 @@ final class ReceiverClient {
     private var userInitiatedDisconnect = false
 
     private let assembler = SampleBufferAssembler()
+    /// Where decoded-and-ready sample buffers go. Invoked on `queue`, straight
+    /// from the receive path: no hop through the main queue, which the UI
+    /// shares and which added visible jitter under load.
+    private var videoSink: ((CMSampleBuffer) -> Void)?
     private var lastKeyframeRequest: Double = 0
     private var videoWindowStart = MonotonicClock.now()
     private var videoWindowFrames = 0
     private var videoWindowBytes = 0
+    private var queueing = QueueingDelayTracker()
+    private var endToEndSum: Double = 0
+    private var endToEndCount = 0
 
     init(profile: ReceiverHardwareProfile, callbackQueue: DispatchQueue = .main) {
         self.profile = profile
@@ -129,6 +146,22 @@ final class ReceiverClient {
         }
     }
 
+    /// Installs the consumer of decoded frames. Takes effect on the network
+    /// queue so the receive path never reads a half-assigned closure.
+    func setVideoSink(_ sink: ((CMSampleBuffer) -> Void)?) {
+        queue.async { [weak self] in self?.videoSink = sink }
+    }
+
+    func setDisplayStatsProvider(_ provider: (() -> (displayed: Int, dropped: Int))?) {
+        queue.async { [weak self] in self?.displayStatsProvider = provider }
+    }
+
+    /// The renderer had to discard a frame and the decoder's reference chain
+    /// is broken until the next IDR.
+    func requestKeyframe() {
+        queue.async { [weak self] in self?.requestKeyframeThrottled() }
+    }
+
     /// Clears everything that describes a live session.
     ///
     /// Must run on every path that ends one — user disconnect, host disconnect,
@@ -143,9 +176,11 @@ final class ReceiverClient {
             self.status.hostDevice = nil
             self.status.negotiated = nil
             self.status.latencyMilliseconds = nil
+            self.status.endToEndMilliseconds = nil
             self.status.measuredFPS = 0
             self.status.measuredBitrateBPS = 0
             self.status.networkType = .unknown
+            self.status.videoOnSeparateConnection = false
         }
     }
 
@@ -187,12 +222,15 @@ final class ReceiverClient {
             guard let self = self else { return }
             self.connectWatchdog = nil
             self.log.error("Connection did not become ready within \(Int(self.connectTimeout))s")
-            self.status.lastError = "Connection timed out"
-
-            self.beginReconnect()
+            self.setLastError("Connection timed out")
+            self.beginReconnect(reason: "Connection timed out")
         }
         connectWatchdog = timer
         timer.resume()
+    }
+
+    private func setLastError(_ message: String?) {
+        callbackQueue.async { [weak self] in self?.status.lastError = message }
     }
 
     private func handleTransport(_ state: TransportState) {
@@ -205,24 +243,24 @@ final class ReceiverClient {
             callbackQueue.async { [weak self] in self?.status.networkType = link }
             advance(.transportReady)
             reconnectDeadline = nil
-            callbackQueue.async { [weak self] in self?.status.lastError = nil }
+            setLastError(nil)
             sendHandshake()
             heartbeat?.start()
 
         case .failed(let reason):
             log.error("Transport failed: \(reason)")
-            callbackQueue.async { [weak self] in self?.status.lastError = reason }
-            beginReconnect()
+            setLastError(reason)
+            beginReconnect(reason: reason)
 
         case .waiting(let reason):
             // NWConnection will sit here forever once the Host's listener has
             // gone away, so drive the retry ourselves.
             log.notice("Transport waiting (\(reason)); retrying")
-            callbackQueue.async { [weak self] in self?.status.lastError = reason }
-            beginReconnect()
+            setLastError(reason)
+            beginReconnect(reason: reason)
 
         case .cancelled:
-            if !userInitiatedDisconnect { beginReconnect() }
+            if !userInitiatedDisconnect { beginReconnect(reason: "Connection closed") }
 
         case .setup, .preparing:
             break
@@ -251,15 +289,69 @@ final class ReceiverClient {
         sendControl(.clientCapabilities(profile.capabilities(network: snapshot)))
     }
 
+    // MARK: - Video connection
+
+    /// Opens the second connection and binds it to the session with the token
+    /// the Host handed out in its `hello`.
+    ///
+    /// Connects to the address the control connection actually resolved to,
+    /// not the Bonjour service endpoint: same interface, no second resolution,
+    /// and no chance of landing on a different one of the Host's addresses.
+    private func openVideoTransport(token: String) {
+        videoTransport?.stop()
+        guard let endpoint = transport?.remoteEndpoint ?? target else { return }
+
+        let channel = NWMessageChannel(endpoint: endpoint, queue: queue)
+        channel.onFrame = { [weak self] frame in self?.handle(frame) }
+        channel.onStateChange = { [weak self] state in
+            guard let self = self else { return }
+            switch state {
+            case .ready:
+                self.log.info("Video connection ready; attaching to session")
+                do {
+                    try channel.sendControl(.attachVideo(.init(sessionToken: token)))
+                } catch {
+                    self.log.failure("Encoding attachVideo", error)
+                }
+                self.callbackQueue.async { self.status.videoOnSeparateConnection = true }
+            case .failed(let reason):
+                self.log.error("Video connection failed: \(reason)")
+                self.closeVideoTransport()
+                if !self.userInitiatedDisconnect { self.beginReconnect(reason: reason) }
+            case .cancelled:
+                self.closeVideoTransport()
+                if !self.userInitiatedDisconnect { self.beginReconnect(reason: "Video connection closed") }
+            case .waiting(let reason):
+                self.log.notice("Video connection waiting (\(reason))")
+            case .setup, .preparing:
+                break
+            }
+        }
+        channel.onError = { [weak self] error in
+            self?.log.failure("Video transport", error)
+        }
+        videoTransport = channel
+        channel.start()
+    }
+
+    private func closeVideoTransport() {
+        guard let channel = videoTransport else { return }
+        videoTransport = nil
+        channel.onStateChange = nil
+        channel.onFrame = nil
+        channel.stop()
+        callbackQueue.async { [weak self] in self?.status.videoOnSeparateConnection = false }
+    }
+
     // MARK: - Reconnection
 
-    private func beginReconnect() {
+    private func beginReconnect(reason: String) {
         guard !userInitiatedDisconnect, target != nil else { return }
 
         // Drop the dead connection now: left alive it keeps firing `waiting`
         // callbacks, which would re-enter this method on every one of them.
         teardownTransport()
-        advance(.transportFailed(reason: status.lastError ?? "Connection lost"))
+        advance(.transportFailed(reason: reason))
 
         // Start the clock on the first failure only, so the grace period covers
         // the whole outage rather than restarting with every retry.
@@ -279,8 +371,6 @@ final class ReceiverClient {
         // Backoff capped at 2s: on a LAN the peer usually returns quickly and a
         // long backoff would just add dead time.
         let attempt = stateMachine.reconnectAttempts
-
-
         let delay = min(pow(1.5, Double(attempt - 1)) * 0.25, 2.0)
         log.info("Reconnect attempt \(attempt) in \(String(format: "%.2f", delay))s")
 
@@ -298,8 +388,10 @@ final class ReceiverClient {
         // The next connection restarts the encoder, so the old parameter sets
         // no longer describe the incoming bitstream.
         assembler.reset()
+        queueing.reset()
         heartbeat?.stop()
         heartbeat = nil
+        closeVideoTransport()
         transport?.onStateChange = nil
         transport?.onFrame = nil
         transport?.stop()
@@ -339,6 +431,9 @@ final class ReceiverClient {
                 self?.status.hostDevice = hello.device
                 self?.status.hostName = hello.device.name
             }
+            if let token = hello.sessionToken {
+                openVideoTransport(token: token)
+            }
 
         case .serverCapabilities(let capabilities):
             log.info("Host codecs: \(capabilities.supportedCodecs.map { $0.rawValue }.joined(separator: ", "))")
@@ -368,6 +463,9 @@ final class ReceiverClient {
             log.info("Host negotiated \(config.mode) \(config.codec.rawValue)")
             callbackQueue.async { [weak self] in self?.status.negotiated = config }
 
+        case .cursor(let update):
+            callbackQueue.async { [weak self] in self?.onCursor?(update) }
+
         case .disconnect(let payload):
             log.info("Host disconnected: \(payload.reason)")
             userInitiatedDisconnect = true
@@ -377,7 +475,7 @@ final class ReceiverClient {
 
         case .error(let payload):
             log.error("Host error \(payload.code): \(payload.message)")
-            callbackQueue.async { [weak self] in self?.status.lastError = payload.message }
+            setLastError(payload.message)
             if payload.code == "E_BUSY" || payload.code == "E_VERSION" {
                 // Not transient: retrying would just be rejected again.
                 userInitiatedDisconnect = true
@@ -387,13 +485,14 @@ final class ReceiverClient {
             }
 
         default:
-            log.debug("Ignoring \(message.kind.rawValue) in phase 1")
+            log.debug("Ignoring \(message.kind.rawValue)")
         }
     }
 
     // MARK: - Video
 
     private func handleVideo(_ frame: OMDFrame) {
+        let arrival = MonotonicClock.now()
         let packet: VideoPacket
         do {
             packet = try VideoPacket.decode(frame.payload)
@@ -421,8 +520,8 @@ final class ReceiverClient {
             }
             do {
                 let sampleBuffer = try assembler.makeSampleBuffer(from: packet)
-                recordVideoStats(byteCount: packet.payload.count)
-                callbackQueue.async { [weak self] in self?.onSampleBuffer?(sampleBuffer) }
+                recordVideoStats(packet: packet, arrival: arrival)
+                videoSink?(sampleBuffer)
             } catch {
                 log.failure("Building sample buffer", error)
                 requestKeyframeThrottled()
@@ -440,24 +539,43 @@ final class ReceiverClient {
         sendControl(.requestKeyframe)
     }
 
-    private func recordVideoStats(byteCount: Int) {
+    private func recordVideoStats(packet: VideoPacket, arrival: Double) {
         videoWindowFrames += 1
-        videoWindowBytes += byteCount
+        videoWindowBytes += packet.payload.count
 
-        let now = MonotonicClock.now()
+        let pts = Double(packet.presentationTimeMicros) / 1_000_000
+        queueing.record(presentationTime: pts, arrival: arrival)
+        // The capture timestamp is on the Host's clock; the heartbeat has
+        // been estimating how far off ours it is.
+        if let localCapture = heartbeat?.clockOffset.localTime(forPeerTime: pts) {
+            endToEndSum += arrival - localCapture
+            endToEndCount += 1
+        }
+
+        let now = arrival
         let elapsed = now - videoWindowStart
         guard elapsed >= 1.0 else { return }
 
         let fps = Double(videoWindowFrames) / elapsed
         let bitrate = Int(Double(videoWindowBytes * 8) / elapsed)
+        let queueingReport = queueing.report()
+        let endToEnd: Double? = endToEndCount > 0
+            ? endToEndSum / Double(endToEndCount) * 1000 : nil
+
         callbackQueue.async { [weak self] in
             self?.status.measuredFPS = fps
             self?.status.measuredBitrateBPS = bitrate
+            self?.status.endToEndMilliseconds = endToEnd
         }
-        reportStatsToHost(fps: fps, bitrate: bitrate)
+        reportStatsToHost(fps: fps, bitrate: bitrate,
+                          queueingMillis: queueingReport?.maxMillis,
+                          endToEndMillis: endToEnd)
+
         videoWindowStart = now
         videoWindowFrames = 0
         videoWindowBytes = 0
+        endToEndSum = 0
+        endToEndCount = 0
     }
 
     /// Tells the Host how the stream is actually arriving here.
@@ -466,8 +584,10 @@ final class ReceiverClient {
     /// cannot infer congestion from its own sends: `NWConnection` reports a
     /// frame as processed once the kernel accepts it into the socket buffer,
     /// which happens immediately even when the link is stalled. Only the
-    /// Receiver knows how many frames actually made it to the screen.
-    private func reportStatsToHost(fps: Double, bitrate: Int) {
+    /// Receiver knows how many frames actually made it to the screen and how
+    /// late they were.
+    private func reportStatsToHost(fps: Double, bitrate: Int,
+                                   queueingMillis: Double?, endToEndMillis: Double?) {
         let display = displayStatsProvider?() ?? (displayed: 0, dropped: 0)
         let total = display.displayed + display.dropped
         let dropRatio = total > 0 ? Double(display.dropped) / Double(total) : 0
@@ -477,13 +597,18 @@ final class ReceiverClient {
             bitrateBPS: bitrate,
             droppedFrameRatio: dropRatio,
             decodeMillis: 0,   // not separable with AVSampleBufferDisplayLayer
-            renderMillis: 0)))
+            renderMillis: 0,
+            queueingDelayMillis: queueingMillis,
+            endToEndMillis: endToEndMillis)))
     }
 
     private func resetVideoStats() {
         videoWindowStart = MonotonicClock.now()
         videoWindowFrames = 0
         videoWindowBytes = 0
+        queueing.reset()
+        endToEndSum = 0
+        endToEndCount = 0
     }
 
     private func sendControl(_ message: ControlMessage) {

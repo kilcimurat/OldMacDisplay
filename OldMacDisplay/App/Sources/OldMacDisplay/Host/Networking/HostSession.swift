@@ -4,9 +4,11 @@ import OldMacDisplayShared
 
 /// One connected Receiver.
 ///
-/// Owns the transport, the protocol handshake and the heartbeat for a single
-/// peer. The server can hold at most one of these in Phase 1, but nothing here
-/// assumes that.
+/// Owns the control transport, the protocol handshake, the heartbeat and,
+/// once the Receiver has attached one, a second transport that carries only
+/// video. Splitting the two keeps a keyframe request or a ping from queueing
+/// behind a 300 KB IDR on a stalled link. The server can hold at most one of
+/// these, but nothing here assumes that.
 final class HostSession {
     struct Peer: Equatable {
         var device: DeviceInfo?
@@ -30,30 +32,40 @@ final class HostSession {
     private(set) var peer: Peer
     private(set) var stateMachine = ConnectionStateMachine()
 
+    /// Presented by the Receiver on its second connection so the server can
+    /// pair it with this session.
+    let sessionToken = UUID().uuidString
+
     private let transport: MessageTransport
+    private var videoTransport: MessageTransport?
     private let queue: DispatchQueue
     private let callbackQueue: DispatchQueue
     private let systemInfo: HostSystemInfo
     private var preferences: HostPreferences
     private var heartbeat: Heartbeat!
     private let log = Log(.network)
+
+    // Everything below is touched on `queue` only.
     private var ended = false
     private var streaming = false
     private var framesInFlight = 0
     private var keyframeRequestedForDrop = false
+    /// Frames dropped because the link could not keep up. Surfaced in the UI so
+    /// a bad network is visible rather than just "feeling" slow.
+    private(set) var droppedFrames = 0
 
-    init(connection: NWConnection,
+    init(transport: MessageTransport,
+         endpoint: String,
          systemInfo: HostSystemInfo,
          preferences: HostPreferences,
          queue: DispatchQueue,
          callbackQueue: DispatchQueue = .main) {
-        self.transport = NWMessageChannel(connection: connection, queue: queue)
+        self.transport = transport
         self.queue = queue
         self.callbackQueue = callbackQueue
         self.systemInfo = systemInfo
         self.preferences = preferences
-        self.peer = Peer(device: nil, capabilities: nil,
-                         endpoint: HostSession.describe(connection.endpoint))
+        self.peer = Peer(device: nil, capabilities: nil, endpoint: endpoint)
 
         self.heartbeat = Heartbeat(queue: queue) { [weak self] message in
             self?.send(message)
@@ -64,21 +76,28 @@ final class HostSession {
         }
     }
 
-    func start() {
+    /// Takes over a transport the server already started to read the first
+    /// frame from. `firstFrame` is that frame, replayed into the session.
+    func start(preconnectedWith firstFrame: OMDFrame?) {
         transport.onStateChange = { [weak self] state in self?.handleTransport(state) }
         transport.onFrame = { [weak self] frame in self?.handle(frame) }
         transport.onError = { [weak self] error in
             self?.log.failure("Session transport", error)
         }
         advance(.connectRequested)
-        transport.start()
+        advance(.transportReady)
+        heartbeat.start()
+        if let frame = firstFrame { handle(frame) }
     }
 
     func disconnect(reason: String) {
-        // Tell the peer why, on a best-effort basis, before tearing down.
-        send(.disconnect(.init(reason: reason)))
-        advance(.disconnectRequested(reason: reason))
-        finish()
+        queue.async { [weak self] in
+            guard let self else { return }
+            // Tell the peer why, on a best-effort basis, before tearing down.
+            self.send(.disconnect(.init(reason: reason)))
+            self.advance(.disconnectRequested(reason: reason))
+            self.finish()
+        }
     }
 
     func updatePreferences(_ preferences: HostPreferences) {
@@ -86,6 +105,46 @@ final class HostSession {
             self?.preferences = preferences
             self?.renegotiateIfPossible()
         }
+    }
+
+    // MARK: - Video transport
+
+    /// Binds a second, already-ready transport as the video carrier. Called by
+    /// the server on `queue` once the connection has presented a matching
+    /// `attachVideo`.
+    func attachVideoTransport(_ videoTransport: MessageTransport) {
+        self.videoTransport?.stop()
+        self.videoTransport = videoTransport
+        videoTransport.onFrame = { [weak self] frame in
+            // Nothing is expected inbound on the video carrier, but a peer
+            // that sends control here is still answered.
+            self?.handle(frame)
+        }
+        videoTransport.onStateChange = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .failed(let reason):
+                self.log.error("Video transport failed: \(reason); falling back to the control connection")
+                self.detachVideoTransport()
+            case .cancelled:
+                self.log.info("Video transport closed; falling back to the control connection")
+                self.detachVideoTransport()
+            default:
+                break
+            }
+        }
+        log.info("Video now carried on a separate connection")
+        // The Receiver's decoder starts from nothing on the new carrier.
+        requestKeyframe()
+    }
+
+    private func detachVideoTransport() {
+        guard videoTransport != nil else { return }
+        videoTransport?.onStateChange = nil
+        videoTransport?.onFrame = nil
+        videoTransport = nil
+        framesInFlight = 0
+        requestKeyframe()
     }
 
     // MARK: - Transport
@@ -114,7 +173,7 @@ final class HostSession {
 
     private func handle(_ frame: OMDFrame) {
         guard frame.channel == .control else {
-            // Video/audio/input channels are not handled until later phases.
+            // Video/audio/input channels are not handled inbound.
             return
         }
         let message: ControlMessage
@@ -138,19 +197,24 @@ final class HostSession {
             advance(.disconnectRequested(reason: payload.reason))
             finish()
         case .networkStats(let stats):
-            log.debug(String(format: "Receiver: %.1f fps displayed, %.1f%% dropped",
-                             stats.fps, stats.droppedFrameRatio * 100))
+            log.debug(String(format: "Receiver: %.1f fps displayed, %.1f%% dropped, queueing %.0f ms",
+                             stats.fps, stats.droppedFrameRatio * 100,
+                             stats.queueingDelayMillis ?? 0))
             callbackQueue.async { [weak self] in self?.onReceiverStats?(stats) }
 
         case .requestKeyframe:
             log.info("Receiver requested a keyframe")
-            callbackQueue.async { [weak self] in self?.onKeyframeRequested?() }
+            requestKeyframe()
 
         case .error(let payload):
             log.error("Receiver reported error \(payload.code): \(payload.message)")
         default:
-            log.debug("Ignoring \(message.kind.rawValue) in phase 1")
+            log.debug("Ignoring \(message.kind.rawValue)")
         }
+    }
+
+    private func requestKeyframe() {
+        callbackQueue.async { [weak self] in self?.onKeyframeRequested?() }
     }
 
     private func handleHello(_ hello: ControlMessage.Hello) {
@@ -158,13 +222,15 @@ final class HostSession {
             let message = "Receiver speaks protocol v\(hello.protocolVersion), host speaks v\(OMDProtocol.version)"
             log.error(message)
             send(.error(.init(code: "E_VERSION", message: message)))
-            disconnect(reason: message)
+            send(.disconnect(.init(reason: message)))
+            advance(.disconnectRequested(reason: message))
+            finish()
             return
         }
         peer.device = hello.device
         log.info("Hello from \(hello.device.name) (\(hello.device.model), macOS \(hello.device.osVersion))")
         notifyPeer()
-        send(.hello(.init(device: systemInfo.device)))
+        send(.hello(.init(device: systemInfo.device, sessionToken: sessionToken)))
     }
 
     private func handleCapabilities(_ capabilities: ClientCapabilities) {
@@ -192,8 +258,8 @@ final class HostSession {
             })
     }
 
-    /// Runs the negotiation and reports the result. Phase 1 only displays the
-    /// outcome; Phase 3 will feed it to the virtual display provider.
+    /// Runs the negotiation and reports the result to the server, which feeds
+    /// it to the virtual display provider.
     private func renegotiateIfPossible() {
         guard let capabilities = peer.capabilities else { return }
         let config = CapabilityNegotiator.negotiate(
@@ -226,7 +292,19 @@ final class HostSession {
         }
     }
 
+    /// Pointer updates ride the control connection: they are tiny, and they
+    /// must not queue behind video.
+    func sendCursor(_ update: ControlMessage.CursorUpdate) {
+        queue.async { [weak self] in
+            guard let self, self.streaming else { return }
+            self.send(.cursor(update))
+        }
+    }
+
     /// Sends one compressed access unit or parameter-set blob.
+    ///
+    /// Called from the encoder's callback thread; the work happens on `queue`
+    /// so the in-flight bookkeeping has a single owner.
     ///
     /// Applies backpressure. Measured on Wi-Fi, the link stalls for a few
     /// hundred milliseconds at a time (a 640 ms RTT spike was recorded while
@@ -242,7 +320,13 @@ final class HostSession {
     /// Keyframes and parameter sets are never dropped: without them the
     /// Receiver cannot decode anything that follows.
     func sendVideo(_ packet: VideoPacket) {
-        guard streaming else { return }
+        queue.async { [weak self] in
+            self?.sendVideoOnQueue(packet)
+        }
+    }
+
+    private func sendVideoOnQueue(_ packet: VideoPacket) {
+        guard streaming, !ended else { return }
 
         let droppable = packet.kind == .accessUnit && !packet.isKeyframe
         if droppable, framesInFlight >= HostSession.maxFramesInFlight {
@@ -253,7 +337,7 @@ final class HostSession {
             // frames and would otherwise decode against missing references.
             if !keyframeRequestedForDrop {
                 keyframeRequestedForDrop = true
-                callbackQueue.async { [weak self] in self?.onKeyframeRequested?() }
+                requestKeyframe()
             }
             return
         }
@@ -261,7 +345,8 @@ final class HostSession {
         if packet.isKeyframe { keyframeRequestedForDrop = false }
 
         framesInFlight += 1
-        transport.send(OMDFrame(channel: .video, payload: packet.encode())) { [weak self] _ in
+        let carrier = videoTransport ?? transport
+        carrier.send(channel: .video, flags: 0, parts: packet.encodedParts()) { [weak self] _ in
             guard let self else { return }
             self.queue.async { self.framesInFlight = max(0, self.framesInFlight - 1) }
         }
@@ -270,10 +355,6 @@ final class HostSession {
     /// Roughly 50 ms of video at 60 fps. Deep enough to ride out ordinary
     /// scheduling jitter, shallow enough that a real stall is noticed at once.
     private static let maxFramesInFlight = 3
-
-    /// Frames dropped because the link could not keep up. Surfaced in the UI so
-    /// a bad network is visible rather than just "feeling" slow.
-    private(set) var droppedFrames = 0
 
     // MARK: - Plumbing
 
@@ -302,6 +383,8 @@ final class HostSession {
         streaming = false
         framesInFlight = 0
         heartbeat.stop()
+        videoTransport?.stop()
+        videoTransport = nil
         transport.stop()
         callbackQueue.async { [weak self] in
             guard let self else { return }
@@ -309,7 +392,7 @@ final class HostSession {
         }
     }
 
-    private static func describe(_ endpoint: NWEndpoint) -> String {
+    static func describe(_ endpoint: NWEndpoint) -> String {
         switch endpoint {
         case .hostPort(let host, _):
             // Strip the IPv6 scope id ("fe80::1%en0") for display.

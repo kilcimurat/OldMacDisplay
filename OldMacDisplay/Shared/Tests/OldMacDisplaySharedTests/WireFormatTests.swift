@@ -98,4 +98,20 @@ final class WireFormatTests: XCTestCase {
             XCTAssertEqual(error as? WireFormatError, .payloadTooLarge(0xFFFFFFFF))
         }
     }
+
+    func testEncodeHeaderMatchesEncodePrefix() throws {
+        let frame = OMDFrame(channel: .video, flags: 0x05, payload: Data(repeating: 1, count: 77))
+        let header = try WireFormat.encodeHeader(channel: .video, flags: 0x05, payloadLength: 77)
+        XCTAssertEqual(header.count, WireFormat.headerLength)
+        XCTAssertEqual(try WireFormat.encode(frame).prefix(WireFormat.headerLength), header)
+        let decoded = try WireFormat.decodeHeader(header)
+        XCTAssertEqual(decoded.channel, .video)
+        XCTAssertEqual(decoded.flags, 0x05)
+        XCTAssertEqual(decoded.payloadLength, 77)
+    }
+
+    func testEncodeHeaderRejectsOversizedPayload() {
+        XCTAssertThrowsError(try WireFormat.encodeHeader(
+            channel: .video, payloadLength: Int(OMDProtocol.maxPayloadLength) + 1))
+    }
 }

@@ -38,6 +38,38 @@ final class HeartbeatTests: XCTestCase {
         XCTAssertEqual(hb.tracker.smoothedMilliseconds ?? 0, 12.0, accuracy: 1e-6)
     }
 
+    /// The pong carries the responder's clock, and the pinger turns that into
+    /// a clock offset it can convert peer timestamps with.
+    func testPongCarriesReceiverClockAndPingerEstimatesOffset() {
+        let hostClock = FakeClock()
+        hostClock.time = 5000
+        let receiverClock = FakeClock()
+        receiverClock.time = 100
+
+        var hostToReceiver: [ControlMessage] = []
+        var receiverToHost: [ControlMessage] = []
+        let host = Heartbeat(queue: .main, now: hostClock.now, send: { hostToReceiver.append($0) })
+        let receiver = Heartbeat(queue: .main, now: receiverClock.now, send: { receiverToHost.append($0) })
+
+        receiver.sendPing()
+        guard case .ping(let ping)? = receiverToHost.first else { return XCTFail("no ping") }
+
+        // 4 ms on the wire each way.
+        hostClock.time += 0.004
+        receiverClock.time += 0.004
+        XCTAssertTrue(host.handle(ping.asMessage))
+        guard case .pong(let pong)? = hostToReceiver.first else { return XCTFail("no pong") }
+        XCTAssertEqual(pong.receivedAt, 5000.004)
+
+        hostClock.time += 0.004
+        receiverClock.time += 0.004
+        XCTAssertTrue(receiver.handle(.pong(pong)))
+
+        XCTAssertEqual(receiver.clockOffset.offset ?? .nan, 4900, accuracy: 1e-9)
+        // A frame captured at host time 5000.5 happened at receiver time 100.5.
+        XCTAssertEqual(receiver.clockOffset.localTime(forPeerTime: 5000.5) ?? .nan, 100.5, accuracy: 1e-9)
+    }
+
     func testSequenceNumbersIncrement() {
         var sequences: [UInt32] = []
         let hb = Heartbeat(queue: .main, send: { message in
@@ -105,4 +137,9 @@ final class HeartbeatTests: XCTestCase {
         hostHeartbeat.sendPing()
         XCTAssertEqual(hostHeartbeat.tracker.lastRTT ?? 0, 0.008, accuracy: 1e-9)
     }
+}
+
+
+private extension ControlMessage.Ping {
+    var asMessage: ControlMessage { .ping(self) }
 }

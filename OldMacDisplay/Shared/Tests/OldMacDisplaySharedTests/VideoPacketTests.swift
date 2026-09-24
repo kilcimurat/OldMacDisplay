@@ -14,6 +14,34 @@ final class VideoPacketTests: XCTestCase {
         XCTAssertEqual(try VideoPacket.decode(packet.encode()), packet)
     }
 
+    /// Scatter-gather sends put the header and payload on the wire as separate
+    /// buffers; what the peer reads back must equal the single-buffer form.
+    func testEncodedPartsConcatenateToEncode() {
+        let packet = VideoPacket(kind: .accessUnit, isKeyframe: true,
+                                 presentationTimeMicros: 42, encodeDurationMicros: 7,
+                                 payload: Data(repeating: 0xCD, count: 300))
+        let parts = packet.encodedParts()
+        XCTAssertEqual(parts.count, 2)
+        XCTAssertEqual(parts[0].count, VideoPacket.headerLength)
+        XCTAssertEqual(parts[0] + parts[1], packet.encode())
+    }
+
+    /// Decoding from a slice with a non-zero start index (what a parser or an
+    /// exact-length socket read hands over) must not read from offset zero.
+    func testDecodeFromSliceWithNonZeroStartIndex() throws {
+        let packet = VideoPacket(kind: .accessUnit, isKeyframe: false,
+                                 presentationTimeMicros: 99, payload: Data([9, 8, 7]))
+        var buffer = Data([0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+        buffer.append(packet.encode())
+        let slice = buffer[5...]
+        XCTAssertNotEqual(slice.startIndex, 0)
+        let decoded = try VideoPacket.decode(slice)
+        XCTAssertEqual(decoded, packet)
+        XCTAssertEqual(Array(decoded.payload), [9, 8, 7])
+        // The payload is itself a slice; consumers must index relative to it.
+        XCTAssertEqual(decoded.payload[decoded.payload.startIndex], 9)
+    }
+
     func testHeaderIsExactlySixteenBytes() {
         let packet = VideoPacket(kind: .accessUnit, payload: Data([1, 2, 3]))
         XCTAssertEqual(packet.encode().count, VideoPacket.headerLength + 3)
