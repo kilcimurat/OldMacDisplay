@@ -36,11 +36,14 @@ final class BonjourAdvertiser {
                 using: parameters,
                 on: NWEndpoint.Port(rawValue: port) ?? .any)
 
+            let addresses = LocalAddresses.current()
+            log.info("Advertising addresses: eth=\(addresses.ethernet ?? "-") wifi=\(addresses.wifi ?? "-")")
             listener.service = NWListener.Service(
                 name: device.name,
                 type: OMDProtocol.bonjourServiceType,
                 domain: nil,
-                txtRecord: BonjourAdvertiser.txtRecordData(for: device))
+                txtRecord: BonjourAdvertiser.txtRecordData(for: device, port: port,
+                                                           addresses: addresses))
 
             listener.stateUpdateHandler = { [weak self] state in
                 guard let self else { return }
@@ -85,13 +88,18 @@ final class BonjourAdvertiser {
     /// Encoded by hand rather than with `NWTXTRecord.data`, which is macOS 13+.
     /// The DNS-SD format is simply a sequence of length-prefixed "key=value"
     /// strings, one byte of length each, so this works on Catalina too.
-    static func txtRecordData(for device: DeviceInfo) -> Data {
-        let entries = [
+    static func txtRecordData(for device: DeviceInfo,
+                              port: UInt16 = OMDProtocol.defaultPort,
+                              addresses: LocalAddresses.Snapshot = .init()) -> Data {
+        var entries = [
             (OMDProtocol.TXTKey.protocolVersion, String(OMDProtocol.version)),
             (OMDProtocol.TXTKey.deviceName, device.name),
             (OMDProtocol.TXTKey.deviceModel, device.model),
-            (OMDProtocol.TXTKey.osVersion, device.osVersion)
+            (OMDProtocol.TXTKey.osVersion, device.osVersion),
+            (OMDProtocol.TXTKey.port, String(port))
         ]
+        if let eth = addresses.ethernet { entries.append((OMDProtocol.TXTKey.ethernetAddress, eth)) }
+        if let wifi = addresses.wifi { entries.append((OMDProtocol.TXTKey.wifiAddress, wifi)) }
 
         var data = Data()
         for (key, value) in entries {

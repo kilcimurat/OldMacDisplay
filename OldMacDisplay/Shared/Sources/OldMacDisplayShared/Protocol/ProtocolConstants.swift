@@ -22,6 +22,13 @@ public enum OMDProtocol {
         public static let deviceName = "name"
         public static let deviceModel = "model"
         public static let osVersion = "os"
+        /// The Host's IPv4 address on each link, so a Receiver that wants a
+        /// specific link can connect straight to that address instead of
+        /// letting the resolver pick whichever of the Host's interfaces
+        /// answers first (usually Wi-Fi, even with a cable in).
+        public static let ethernetAddress = "eth"
+        public static let wifiAddress = "wifi"
+        public static let port = "port"
     }
 
     /// Upper bound on a single frame payload. Guards the receive loop against a

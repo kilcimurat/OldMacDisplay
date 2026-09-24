@@ -23,9 +23,16 @@ public final class NWMessageChannel: MessageTransport {
     }
 
     /// Creates an outbound connection (client side).
-    public convenience init(endpoint: NWEndpoint, queue: DispatchQueue) {
-        self.init(connection: NWConnection(to: endpoint, using: NWMessageChannel.parameters()),
-                  queue: queue)
+    ///
+    /// `requiredInterfaceType` pins the connection to one kind of link. Only
+    /// use it with a concrete `hostPort` endpoint on that link: with a
+    /// Bonjour service endpoint the constraint stalls the connection (see
+    /// `parameters()`).
+    public convenience init(endpoint: NWEndpoint, queue: DispatchQueue,
+                            requiredInterfaceType: NWInterface.InterfaceType? = nil) {
+        let params = NWMessageChannel.parameters()
+        if let type = requiredInterfaceType { params.requiredInterfaceType = type }
+        self.init(connection: NWConnection(to: endpoint, using: params), queue: queue)
     }
 
     /// Low-latency TCP parameters shared by both ends.

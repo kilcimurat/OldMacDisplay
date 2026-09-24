@@ -182,7 +182,13 @@ the Host when asked. The Host listens on TCP port 51843.
    "Waiting for a receiver".
 2. **On the old Mac**, launch OldMacDisplay. It opens on **Use As Display**
    and lists every Host it can see. Pick the link you want to use with the
-   **Ethernet / Wi-Fi** switch; only Hosts reachable over that link are shown.
+   **Ethernet / Wi-Fi** switch; only Hosts reachable over that link are shown,
+   and the connection is made over that link: the Host publishes its address
+   on each link, and the Receiver connects straight to the chosen one, pinned
+   to that interface. Without this, a Mac with both a cable and Wi-Fi was
+   often reached over Wi-Fi even with **Ethernet** selected, and the stream
+   suffered for it. If the pinned attempt does not come up within 4 s the
+   Receiver falls back to letting the system route.
 3. Select the Host and click **Connect**. The two machines negotiate a
    resolution, codec and bitrate from the Receiver's panel size, decoder
    hardware and link type.
@@ -204,6 +210,11 @@ If the cable is pulled or Wi-Fi drops, the Receiver keeps the last frame on
 screen and retries for **30 seconds** with a short backoff. If the Host comes
 back within that window, the session resumes with a fresh keyframe and no
 user action. After 30 seconds it gives up and reports why.
+
+Both sides also watch the heartbeat: **6 seconds** without anything from the
+peer ends the session ("stopped responding"). TCP alone would not notice a
+vanished peer for minutes while video is being sent, which left the Host
+showing "Connected" long after the old Mac had gone.
 
 ## Settings
 
@@ -332,7 +343,15 @@ raise Quality; if the link cannot sustain it, the Host panel will show
 The two machines run different protocol versions. Copy the same build to
 both. The subtitle names the version each side speaks.
 
-**Connect stays on "Connecting…" then fails after 6 seconds.**
+**The Receiver says "over Wi-Fi" although a cable is connected.**
+Make sure **Ethernet** is selected on the Receiver before connecting: that is
+what pins the connection to the cable. If it still lands on Wi-Fi, the Host
+did not publish an Ethernet address (its cable is not up, or the adapter is
+a bridge macOS does not report as Ethernet); the Host's log line
+"Advertising addresses" shows what it found. `--connect <Ethernet IP>` from
+the Receiver also forces the cable.
+
+**Connect stays on "Connecting…" then fails.**
 The address resolved but nothing answered: firewall on the Host blocking
 port 51843, or a VPN routing the traffic away. The Receiver retries for 30 s.
 

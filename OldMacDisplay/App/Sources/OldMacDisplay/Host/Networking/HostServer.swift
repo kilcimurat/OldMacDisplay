@@ -316,6 +316,10 @@ final class HostServer {
         controller.onStats = { [weak self] stats in
             self?.callbackQueue.async {
                 self?.status.streaming = true
+                // Frames are flowing, so whatever went wrong before (a
+                // capture that stopped when the previous virtual display was
+                // torn down, say) is over.
+                self?.status.lastError = nil
                 self?.status.measuredFPS = stats.measuredFPS
                 self?.status.measuredBitrateBPS = stats.measuredBitrateBPS
                 self?.status.encodeMillis = stats.averageEncodeMillis
@@ -368,6 +372,11 @@ final class HostServer {
         cursorTracker?.stop()
         cursorTracker = nil
         if #available(macOS 13.0, *), let controller = streamController as? StreamController {
+            // Tearing the virtual display down stops the capture on it with
+            // "failed to find any displays to capture"; that is expected here,
+            // not something to show the user.
+            controller.onError = nil
+            controller.onStats = nil
             controller.stop()
         }
         streamController = nil

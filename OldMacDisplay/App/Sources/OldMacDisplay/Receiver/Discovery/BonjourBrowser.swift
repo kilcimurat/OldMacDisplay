@@ -18,6 +18,19 @@ struct DiscoveredHost: Equatable {
     let model: String?
     let osVersion: String?
     let protocolVersion: Int?
+    /// The Host's own IPv4 address per link, from its TXT record, plus the
+    /// port it listens on. Lets the Receiver connect to the cable's address
+    /// directly instead of whichever address the resolver reaches first.
+    var addresses: [LinkFilter: String] = [:]
+    var port: UInt16 = OMDProtocol.defaultPort
+
+    /// A concrete endpoint on `link`, if the Host published one.
+    func directEndpoint(over link: LinkFilter) -> NWEndpoint? {
+        guard let address = addresses[link], let nwPort = NWEndpoint.Port(rawValue: port) else {
+            return nil
+        }
+        return .hostPort(host: NWEndpoint.Host(address), port: nwPort)
+    }
 
     /// Whether this Host was advertised over `link`.
     func isReachable(over link: LinkFilter) -> Bool {
@@ -168,10 +181,15 @@ final class BonjourBrowser {
         var model: String?
         var osVersion: String?
         var protocolVersion: Int?
+        var addresses: [LinkFilter: String] = [:]
+        var port = OMDProtocol.defaultPort
         if case .bonjour(let txt) = result.metadata {
             model = txt[OMDProtocol.TXTKey.deviceModel]
             osVersion = txt[OMDProtocol.TXTKey.osVersion]
             protocolVersion = txt[OMDProtocol.TXTKey.protocolVersion].flatMap(Int.init)
+            if let eth = txt[OMDProtocol.TXTKey.ethernetAddress] { addresses[.ethernet] = eth }
+            if let wifi = txt[OMDProtocol.TXTKey.wifiAddress] { addresses[.wifi] = wifi }
+            if let published = txt[OMDProtocol.TXTKey.port].flatMap(UInt16.init) { port = published }
         }
 
         return DiscoveredHost(endpoint: result.endpoint,
@@ -179,6 +197,8 @@ final class BonjourBrowser {
                               serviceName: name,
                               model: model,
                               osVersion: osVersion,
-                              protocolVersion: protocolVersion)
+                              protocolVersion: protocolVersion,
+                              addresses: addresses,
+                              port: port)
     }
 }

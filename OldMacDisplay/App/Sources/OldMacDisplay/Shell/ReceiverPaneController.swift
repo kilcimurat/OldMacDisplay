@@ -273,14 +273,14 @@ final class ReceiverPaneController: NSViewController {
         hasAutoConnected = true
         tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
         log.info("Auto-connecting to \(hosts[index].serviceName) (listed under \(link.title))")
-        client.connect(to: hosts[index])
+        client.connect(to: hosts[index], preferring: link)
     }
 
     @objc private func connectTapped() {
         let row = tableView.selectedRow
         guard hosts.indices.contains(row) else { return }
         log.info("Connecting to \(hosts[row].serviceName) (listed under \(link.title))")
-        client.connect(to: hosts[row])
+        client.connect(to: hosts[row], preferring: link)
     }
 
     @objc private func disconnectTapped() {

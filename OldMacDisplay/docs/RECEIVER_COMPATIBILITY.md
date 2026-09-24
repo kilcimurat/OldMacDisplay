@@ -162,10 +162,13 @@ So the connection is unconstrained, and `ReceiverClient` carries a connect
 watchdog that fails a connection which has not become ready in 6 seconds — the
 stall is at least visible now rather than an indefinite "Connecting".
 
-**VPN avoidance remains unsolved for the first connection.** Disconnect the
-VPN before starting a session. The second (video) connection already does the
-right thing: it is opened to the concrete address the control connection
-resolved to (`NWMessageChannel.remoteEndpoint`), not to the service endpoint,
-so it lands on the same interface without any constraint. Doing the same for
-the control connection would mean resolving the Bonjour service to a concrete
-address on the chosen subnet first.
+**Now largely solved by connecting to a concrete address.** The Host
+publishes its IPv4 address per link in the TXT record (`eth`, `wifi`, `port`).
+When the user has picked a link, the Receiver's first attempt goes straight to
+that address with `requiredInterfaceType` set — a constraint that is safe
+here precisely because the endpoint is a single `hostPort` on that link, not
+a Bonjour service with addresses on every interface. If it does not come up
+in 4 s the Receiver falls back to the unconstrained service endpoint. The
+video connection reuses the control connection's resolved address and pin.
+A VPN can still interfere with the fallback path; disconnect it if the pinned
+attempt keeps failing.

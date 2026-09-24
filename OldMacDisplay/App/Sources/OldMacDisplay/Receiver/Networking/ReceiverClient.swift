@@ -57,15 +57,33 @@ final class ReceiverClient {
     private let pathObserver: PathObserver
     private let log = Log(.network)
 
+    /// One way of reaching the Host. The plan is tried in order; a pinned
+    /// attempt that does not come up within its timeout falls through to the
+    /// next rather than counting as a lost connection.
+    private struct ConnectAttempt {
+        let endpoint: NWEndpoint
+        /// Pins the connection to this kind of link. Only ever set together
+        /// with a concrete `hostPort` endpoint on that link.
+        let interfaceType: NWInterface.InterfaceType?
+        let timeout: TimeInterval
+        var label: String {
+            switch interfaceType {
+            case .wiredEthernet?: return "Ethernet-pinned \(endpoint)"
+            case .wifi?: return "Wi-Fi-pinned \(endpoint)"
+            default: return "unpinned \(endpoint)"
+            }
+        }
+    }
+
     // Everything below is touched on `queue` only.
     private var transport: NWMessageChannel?
     private var videoTransport: NWMessageChannel?
     private var heartbeat: Heartbeat?
     private var stateMachine = ConnectionStateMachine()
-    private var target: NWEndpoint?
+    private var plan: [ConnectAttempt] = []
+    private var planIndex = 0
+    private var target: NWEndpoint? { plan.first?.endpoint }
     private var reconnectDeadline: Date?
-    /// How long a connection may stay un-ready before it is treated as failed.
-    private let connectTimeout: TimeInterval = 6
     private var connectWatchdog: DispatchSourceTimer?
     private var reconnectTimer: DispatchSourceTimer?
     private var userInitiatedDisconnect = false
@@ -103,11 +121,23 @@ final class ReceiverClient {
 
     // MARK: - Public API
 
-    func connect(to host: DiscoveredHost) {
+    /// `link` is the link the user picked in the pane. When the Host
+    /// published its address on that link, the first attempt goes straight to
+    /// it, pinned to that interface type, so a Mac with both a cable and
+    /// Wi-Fi is actually reached over the cable. The plain service endpoint
+    /// remains as the fallback.
+    func connect(to host: DiscoveredHost, preferring link: LinkFilter? = nil) {
+        var plan: [ConnectAttempt] = []
+        if let link = link, let direct = host.directEndpoint(over: link) {
+            plan.append(ConnectAttempt(endpoint: direct, interfaceType: link.interfaceType, timeout: 4))
+        }
+        plan.append(ConnectAttempt(endpoint: host.endpoint, interfaceType: nil, timeout: 6))
+
         queue.async { [weak self] in
             guard let self = self else { return }
             self.userInitiatedDisconnect = false
-            self.target = host.endpoint
+            self.plan = plan
+            self.planIndex = 0
             self.reconnectDeadline = nil
             self.callbackQueue.async { self.status.hostName = host.serviceName }
             self.advance(.connectRequested)
@@ -187,10 +217,14 @@ final class ReceiverClient {
     // MARK: - Transport lifecycle
 
     private func openTransport() {
-        guard let target = target else { return }
+        guard !plan.isEmpty else { return }
         teardownTransport()
+        if planIndex >= plan.count { planIndex = 0 }
+        let attempt = plan[planIndex]
+        log.info("Connecting: \(attempt.label)")
 
-        let channel = NWMessageChannel(endpoint: target, queue: queue)
+        let channel = NWMessageChannel(endpoint: attempt.endpoint, queue: queue,
+                                       requiredInterfaceType: attempt.interfaceType)
         channel.onStateChange = { [weak self] state in self?.handleTransport(state) }
         channel.onFrame = { [weak self] frame in self?.handle(frame) }
         channel.onError = { [weak self] error in
@@ -205,29 +239,52 @@ final class ReceiverClient {
             guard let self = self else { return }
             self.callbackQueue.async { self.status.latencyMilliseconds = tracker.smoothedMilliseconds }
         }
+        heartbeat.onTimeout = { [weak self] in
+            guard let self = self else { return }
+            self.log.error("Host stopped responding")
+            self.setLastError("Host stopped responding")
+            self.beginReconnect(reason: "Host stopped responding")
+        }
         self.heartbeat = heartbeat
 
-        armConnectWatchdog()
+        armConnectWatchdog(timeout: attempt.timeout)
         channel.start()
+    }
+
+    /// A connection attempt failed before becoming ready. If the plan has a
+    /// fallback (the pinned attempt did not come up), try that next without
+    /// entering the reconnect state; otherwise it is a real failure.
+    private func attemptFailed(reason: String) {
+        if planIndex + 1 < plan.count {
+            log.notice("Attempt \(plan[planIndex].label) failed (\(reason)); trying the next")
+            planIndex += 1
+            openTransport()
+        } else {
+            planIndex = 0
+            setLastError(reason)
+            beginReconnect(reason: reason)
+        }
     }
 
     /// `NWConnection` can sit in `.preparing` indefinitely when it is pinned to
     /// an interface that cannot reach the Host, emitting neither `waiting` nor
     /// `failed`. Without this the UI would show "Connecting" forever.
-    private func armConnectWatchdog() {
+    private func armConnectWatchdog(timeout: TimeInterval) {
         connectWatchdog?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + connectTimeout)
+        timer.schedule(deadline: .now() + timeout)
         timer.setEventHandler { [weak self] in
             guard let self = self else { return }
             self.connectWatchdog = nil
-            self.log.error("Connection did not become ready within \(Int(self.connectTimeout))s")
-            self.setLastError("Connection timed out")
-            self.beginReconnect(reason: "Connection timed out")
+            self.log.error("Connection did not become ready within \(Int(timeout))s")
+            self.attemptFailed(reason: "Connection timed out")
         }
         connectWatchdog = timer
         timer.resume()
     }
+
+    /// True until the current attempt has come up.
+    private var connecting: Bool { connectWatchdog != nil }
 
     private func setLastError(_ message: String?) {
         callbackQueue.async { [weak self] in self?.status.lastError = message }
@@ -239,7 +296,7 @@ final class ReceiverClient {
             connectWatchdog?.cancel()
             connectWatchdog = nil
             let link = transport?.currentInterfaceType ?? .unknown
-            log.info("Connected over \(link.rawValue)")
+            log.info("Connected over \(link.rawValue) via \(plan[planIndex].label)")
             callbackQueue.async { [weak self] in self?.status.networkType = link }
             advance(.transportReady)
             reconnectDeadline = nil
@@ -249,15 +306,23 @@ final class ReceiverClient {
 
         case .failed(let reason):
             log.error("Transport failed: \(reason)")
-            setLastError(reason)
-            beginReconnect(reason: reason)
+            if connecting {
+                attemptFailed(reason: reason)
+            } else {
+                setLastError(reason)
+                beginReconnect(reason: reason)
+            }
 
         case .waiting(let reason):
             // NWConnection will sit here forever once the Host's listener has
             // gone away, so drive the retry ourselves.
             log.notice("Transport waiting (\(reason)); retrying")
-            setLastError(reason)
-            beginReconnect(reason: reason)
+            if connecting {
+                attemptFailed(reason: reason)
+            } else {
+                setLastError(reason)
+                beginReconnect(reason: reason)
+            }
 
         case .cancelled:
             if !userInitiatedDisconnect { beginReconnect(reason: "Connection closed") }
@@ -301,7 +366,10 @@ final class ReceiverClient {
         videoTransport?.stop()
         guard let endpoint = transport?.remoteEndpoint ?? target else { return }
 
-        let channel = NWMessageChannel(endpoint: endpoint, queue: queue)
+        // Same concrete address and the same pin as the control connection,
+        // so both carriers share one link.
+        let channel = NWMessageChannel(endpoint: endpoint, queue: queue,
+                                       requiredInterfaceType: plan[planIndex].interfaceType)
         channel.onFrame = { [weak self] frame in self?.handle(frame) }
         channel.onStateChange = { [weak self] state in
             guard let self = self else { return }
@@ -346,7 +414,7 @@ final class ReceiverClient {
     // MARK: - Reconnection
 
     private func beginReconnect(reason: String) {
-        guard !userInitiatedDisconnect, target != nil else { return }
+        guard !userInitiatedDisconnect, !plan.isEmpty else { return }
 
         // Drop the dead connection now: left alive it keeps firing `waiting`
         // callbacks, which would re-enter this method on every one of them.

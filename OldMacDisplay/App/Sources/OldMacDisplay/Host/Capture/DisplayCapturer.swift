@@ -70,21 +70,35 @@ final class DisplayCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// run on Catalina, which ships no Swift Concurrency runtime, so the whole
     /// binary stays concurrency-free.
     static func resolveDisplay(id: CGDirectDisplayID?,
+                               attemptsLeft: Int = 10,
                                completion: @escaping (Result<SCDisplay, Error>) -> Void) {
         // `excludingDesktopWindows:false` keeps wallpaper and desktop icons.
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) {
             content, error in
+            // A virtual display that CoreGraphics already lists can take a
+            // moment longer to show up in ScreenCaptureKit's content, so a
+            // miss right after creating one is retried for ~2 s.
+            func retryOrFail(_ failure: Error) {
+                guard attemptsLeft > 1 else {
+                    completion(.failure(failure))
+                    return
+                }
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.2) {
+                    resolveDisplay(id: id, attemptsLeft: attemptsLeft - 1, completion: completion)
+                }
+            }
+
             if let error = error {
-                completion(.failure(error))
+                retryOrFail(error)
                 return
             }
             guard let content = content, !content.displays.isEmpty else {
-                completion(.failure(CaptureError.noDisplaysFound))
+                retryOrFail(CaptureError.noDisplaysFound)
                 return
             }
             if let id = id {
                 guard let match = content.displays.first(where: { $0.displayID == id }) else {
-                    completion(.failure(CaptureError.displayNotFound(id)))
+                    retryOrFail(CaptureError.displayNotFound(id))
                     return
                 }
                 completion(.success(match))

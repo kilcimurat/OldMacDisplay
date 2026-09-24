@@ -74,6 +74,15 @@ final class HostSession {
             guard let self else { return }
             self.callbackQueue.async { self.onLatency?(tracker) }
         }
+        self.heartbeat.onTimeout = { [weak self] in
+            guard let self else { return }
+            // The Host never reconnects (the Receiver does), so this is a
+            // terminal state, not the start of a grace period.
+            let reason = "Receiver stopped responding"
+            self.log.error(reason)
+            self.advance(.disconnectRequested(reason: reason))
+            self.finish()
+        }
     }
 
     /// Takes over a transport the server already started to read the first
@@ -156,7 +165,7 @@ final class HostSession {
             heartbeat.start()
         case .failed(let reason):
             log.error("Session transport failed: \(reason)")
-            advance(.transportFailed(reason: reason))
+            advance(.disconnectRequested(reason: "Connection failed: \(reason)"))
             finish()
         case .cancelled:
             advance(.disconnectRequested(reason: "Receiver disconnected"))

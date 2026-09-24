@@ -70,6 +70,44 @@ final class HeartbeatTests: XCTestCase {
         XCTAssertEqual(receiver.clockOffset.localTime(forPeerTime: 5000.5) ?? .nan, 100.5, accuracy: 1e-9)
     }
 
+    /// A peer that has gone silent is reported once, after `timeout`, and
+    /// any inbound message resets the clock.
+    func testSilentPeerTimesOutOnce() {
+        let clock = FakeClock()
+        var timeouts = 0
+        var pings = 0
+        let hb = Heartbeat(interval: 1, timeout: 6, queue: .main, now: clock.now, send: { message in
+            if case .ping = message { pings += 1 }
+        })
+        hb.onTimeout = { timeouts += 1 }
+        hb.start()
+        defer { hb.stop() }
+
+        // Alive: a message arrives, then five quiet seconds are fine.
+        hb.handle(.streamStart)
+        for _ in 0..<5 {
+            clock.time += 1
+            hb.tick()
+        }
+        XCTAssertEqual(timeouts, 0)
+
+        // Anything inbound resets the deadline.
+        hb.handle(.pong(.init(sequence: 1, sentAt: clock.time - 0.01)))
+        clock.time += 5.9
+        hb.tick()
+        XCTAssertEqual(timeouts, 0)
+
+        clock.time += 0.2
+        hb.tick()
+        XCTAssertEqual(timeouts, 1)
+        let pingsAtTimeout = pings
+        // Reported once; no further pings into the void.
+        clock.time += 1
+        hb.tick()
+        XCTAssertEqual(timeouts, 1)
+        XCTAssertEqual(pings, pingsAtTimeout)
+    }
+
     func testSequenceNumbersIncrement() {
         var sequences: [UInt32] = []
         let hb = Heartbeat(queue: .main, send: { message in

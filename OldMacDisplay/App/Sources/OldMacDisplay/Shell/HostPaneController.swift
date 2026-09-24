@@ -370,6 +370,15 @@ final class HostPaneController: NSViewController {
                     text += String(format: ", queueing %.0f ms", queueing)
                 }
             }
+            // When the controller has had to give up more than half the
+            // budget, the link is the problem and no quality setting will fix
+            // it; say so rather than letting the user chase encoder settings.
+            if let current = status.currentBitrateBPS,
+               let target = status.negotiated?.targetBitrateBPS,
+               Double(current) < Double(target) * 0.5 {
+                text += "\n⚠︎ The link cannot carry this mode. Use Ethernet, or lower the resolution or frame rate."
+                streamLabel.maximumNumberOfLines = 3
+            }
             PaneStyle.setText(streamLabel, text)
         } else {
             PaneStyle.setText(streamLabel, "")
